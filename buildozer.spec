@@ -18,14 +18,16 @@ version = 0.1
 # ffmpeg_bin: recipe local (ver recipes/ffmpeg_bin/) que empaqueta el
 #          binario real de ffmpeg dentro del .apk.
 #
-# python3==3.11 / hostpython3==3.11: fijo la version (si no, toma la mas
-# nueva disponible -- en un intento anterior tomo 3.14, recien salida, y
-# una dependencia de yt-dlp (charset_normalizer) todavia no tiene wheel
-# precompilado para Android en esa version tan nueva). 3.11 es una version
-# mucho mas usada y probada en python-for-android. Hay que fijar las DOS
-# (la que corre en el celular y la que corre durante la compilacion) --
-# python-for-android exige que sean la misma version.
-requirements = python3==3.11,hostpython3==3.11,kivy,yt-dlp,certifi,mutagen,pyjnius,ffmpeg_bin
+# python3==3.11.9 / hostpython3==3.11.9: fijo la version EXACTA (con
+# parche -- python-for-android descarga el tag de git "vX.Y.Z" de
+# cpython, y un tag como "v3.11" sin numero de parche no existe). Fijo la
+# version ademas porque la mas nueva disponible (3.14, recien salida)
+# todavia no tiene wheel precompilado para Android de una dependencia de
+# yt-dlp (charset_normalizer). 3.11.9 es una version mucho mas usada y
+# probada en python-for-android. Hay que fijar las DOS (la que corre en
+# el celular y la que corre durante la compilacion) -- python-for-android
+# exige que sean la misma version.
+requirements = python3==3.11.9,hostpython3==3.11.9,kivy,yt-dlp,certifi,mutagen,pyjnius,ffmpeg_bin
 
 orientation = portrait
 fullscreen = 0
