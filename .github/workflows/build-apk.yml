@@ -10,22 +10,49 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04 fijo (no "ubuntu-latest"): la accion de Docker que
+    # usabamos antes (ArtemSBulgakov/buildozer-action) se rompio porque la
+    # imagen de Kivy se actualizo a una version de Ubuntu demasiado nueva
+    # para la que el PPA de Java todavia no publico paquetes. Instalando
+    # todo a mano sobre 22.04 (una base estable y muy probada para
+    # buildozer/python-for-android) evitamos depender de ese Dockerfile de
+    # terceros.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compilar con Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
+      - name: Cachear el SDK/NDK de Android (son ~1-2GB, acelera builds siguientes)
+        uses: actions/cache@v4
         with:
-          command: buildozer android debug
-          buildozer_version: stable
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-
+
+      - name: Instalar dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk python3-pip python3-dev \
+            autoconf libtool pkg-config zlib1g-dev cmake \
+            libffi-dev libssl-dev automake build-essential ccache libltdl-dev
+
+      - name: Instalar Buildozer
+        run: |
+          pip3 install --upgrade pip
+          pip3 install --upgrade buildozer
+
+      - name: Compilar con Buildozer
+        run: |
+          yes | buildozer -v android debug
 
       - name: Subir el .apk como artifact (para ver logs/debug rapido)
         uses: actions/upload-artifact@v4
         with:
           name: apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: bin/*.apk
 
       - name: Publicar el .apk en una Release (para instalar desde el celular)
         uses: softprops/action-gh-release@v2
@@ -39,4 +66,4 @@ jobs:
             descargar el .apk de "Assets" y abrirlo. Android va a pedir
             permiso para "instalar apps de origenes desconocidos" la primera
             vez -- hay que aceptarlo para este archivo.
-          files: ${{ steps.buildozer.outputs.filename }}
+          files: bin/*.apk
