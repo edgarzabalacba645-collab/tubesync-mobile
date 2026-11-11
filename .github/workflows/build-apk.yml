@@ -31,11 +31,19 @@ jobs:
           restore-keys: |
             buildozer-
 
+      - name: Fijar Java 17 (el runner trae varias JDK instaladas y JAVA_HOME
+          apuntaba a la 11 -- instalar el paquete con apt no alcanza porque
+          no cambia esa variable; setup-java si la fija para el resto del job)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
       - name: Instalar dependencias del sistema
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk python3-pip python3-dev \
+            git zip unzip python3-pip python3-dev \
             autoconf libtool pkg-config zlib1g-dev cmake \
             libffi-dev libssl-dev automake build-essential ccache libltdl-dev
 
