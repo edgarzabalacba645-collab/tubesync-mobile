@@ -17,7 +17,13 @@ version = 0.1
 #          nativeLibraryDir (ruta de ffmpeg) y la carpeta de descargas.
 # ffmpeg_bin: recipe local (ver recipes/ffmpeg_bin/) que empaqueta el
 #          binario real de ffmpeg dentro del .apk.
-requirements = python3,kivy,yt-dlp,certifi,mutagen,pyjnius,ffmpeg_bin
+#
+# python3==3.11: fijo la version (si no, toma la mas nueva disponible --
+# en un intento anterior tomo 3.14, recien salida, y una dependencia de
+# yt-dlp (charset_normalizer) todavia no tiene wheel precompilado para
+# Android en esa version tan nueva). 3.11 es una version mucho mas usada
+# y probada en python-for-android.
+requirements = python3==3.11,kivy,yt-dlp,certifi,mutagen,pyjnius,ffmpeg_bin
 
 orientation = portrait
 fullscreen = 0
