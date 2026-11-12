@@ -71,6 +71,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
@@ -114,11 +115,20 @@ def ffmpeg_path():
     return None
 
 
-def carpeta_descargas():
-    """Carpeta donde se guardan los MP3 finales. Es la carpeta EXTERNA
-    propia de la app (getExternalFilesDir) -- a diferencia del
-    almacenamiento compartido (Download/Music de todo el telefono), escribir
-    ahi no pide ningun permiso especial en ninguna version de Android."""
+# Subcarpeta DENTRO de la carpeta publica "Descargas" del telefono donde
+# termina viviendo cada mp3 -- un solo lugar, nada de copias.
+NOMBRE_SUBCARPETA_PUBLICA = "TubeSync Mobile"
+RUTA_RELATIVA_PUBLICA = f"Download/{NOMBRE_SUBCARPETA_PUBLICA}/"
+
+
+def carpeta_trabajo():
+    """Carpeta de trabajo PRIVADA (getExternalFilesDir): ahi es donde
+    yt-dlp/ffmpeg escriben mientras procesan un audio (y donde queda el
+    log). NO es el destino final -- antes si lo era, pero eso duplicaba
+    cada mp3 (uno acá + una copia en la carpeta publica de Descargas) y
+    ocupaba el doble de espacio. Ahora, apenas un archivo termina de
+    procesarse, se publica en la carpeta PUBLICA de Descargas (ver
+    _publicar_en_musica) y el de aca se borra."""
     try:
         from jnius import autoclass
 
@@ -127,8 +137,8 @@ def carpeta_descargas():
         base = activity.getExternalFilesDir(None).getAbsolutePath()
     except Exception:
         # Modo desarrollo en PC (sin Android): una carpeta cualquiera al lado del proyecto.
-        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_descargas_dev")
-    carpeta = os.path.join(base, "Descargas")
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_trabajo_dev")
+    carpeta = os.path.join(base, "tmp")
     os.makedirs(carpeta, exist_ok=True)
     return carpeta
 
@@ -148,7 +158,7 @@ def asegurar_stdio():
     cualquier otro problema a futuro (se puede mandar por WhatsApp/Drive
     como cualquier otro archivo)."""
     try:
-        carpeta = carpeta_descargas()
+        carpeta = carpeta_trabajo()
         log_path = os.path.join(os.path.dirname(carpeta), "tubesync.log")
         log_file = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
         sys.stdout = log_file
@@ -185,15 +195,19 @@ class Tarjeta(BoxLayout):
 
 
 class BotonAccion(Button):
-    """Boton con el color de acento y esquinas redondeadas, en vez del
-    boton gris plano default de Kivy."""
+    """Boton con esquinas redondeadas, en vez del boton gris plano default
+    de Kivy. Por defecto usa el color de acento (rojo/coral), pero acepta
+    color_normal/color_press para variantes (como el boton destructivo de
+    "Borrar todo")."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, color_normal=None, color_press=None, **kwargs):
         super().__init__(background_normal="", background_down="", background_color=(0, 0, 0, 0), **kwargs)
         self.color = (1, 1, 1, 1)
         self.bold = True
+        self._color_normal = color_normal or COLOR_ACENTO
+        self._color_press = color_press or COLOR_ACENTO_OSCURO
         with self.canvas.before:
-            self._color_fondo = Color(*COLOR_ACENTO)
+            self._color_fondo = Color(*self._color_normal)
             self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(14)])
         self.bind(pos=self._actualizar_rect, size=self._actualizar_rect, state=self._actualizar_color)
 
@@ -202,7 +216,7 @@ class BotonAccion(Button):
         self._rect.size = self.size
 
     def _actualizar_color(self, *_):
-        self._color_fondo.rgba = COLOR_ACENTO_OSCURO if self.state == "down" else COLOR_ACENTO
+        self._color_fondo.rgba = self._color_press if self.state == "down" else self._color_normal
 
 
 class BarraProgreso(Widget):
@@ -410,7 +424,7 @@ class TubeSyncMobileApp(App):
     def build(self):
         asegurar_stdio()
         self.cola = queue.Queue()
-        self.carpeta_destino = carpeta_descargas()
+        self.carpeta_trabajo = carpeta_trabajo()
 
         raiz = BoxLayout(orientation="vertical")
 
@@ -505,7 +519,7 @@ class TubeSyncMobileApp(App):
 
         self.vista_nueva.add_widget(
             Label(
-                text=f"Se guardan en:\n{self.carpeta_destino}",
+                text=f"Se guardan en:\nDescargas / {NOMBRE_SUBCARPETA_PUBLICA}",
                 size_hint_y=None,
                 height=dp(46),
                 font_size=dp(10.5),
@@ -517,6 +531,13 @@ class TubeSyncMobileApp(App):
 
         # --- Vista "Mis descargas" ------------------------------------------
         self.vista_descargas = BoxLayout(orientation="vertical", spacing=dp(10))
+
+        self.boton_borrar_todo = BotonAccion(
+            text="BORRAR TODO", size_hint_y=None, height=dp(40), font_size=dp(12),
+            color_normal=COLOR_ERROR, color_press=COLOR_ACENTO_OSCURO,
+        )
+        self.boton_borrar_todo.bind(on_release=lambda *_: self._confirmar_borrar_todo())
+        self.vista_descargas.add_widget(self.boton_borrar_todo)
 
         self.label_descargas_vacio = Label(
             text="Todavia no descargaste ningun audio.",
@@ -550,30 +571,112 @@ class TubeSyncMobileApp(App):
             self._refrescar_descargas()
             self.area_vistas.add_widget(self.vista_descargas)
 
+    def _consultar_descargas_publicas(self):
+        """Lee la lista REAL de archivos que hay en la carpeta publica de
+        Descargas (Download/TubeSync Mobile) via MediaStore -- ya no hay
+        una carpeta privada propia para listar (eso duplicaba espacio), asi
+        que esto es ahora la UNICA fuente de verdad de "Mis descargas"."""
+        from jnius import autoclass
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
+        activity = PythonActivity.mActivity
+        resolver = activity.getContentResolver()
+
+        proyeccion = ["_display_name", "_size"]
+        cursor = resolver.query(
+            MediaStoreDownloads.EXTERNAL_CONTENT_URI,
+            proyeccion,
+            "relative_path = ?",
+            [RUTA_RELATIVA_PUBLICA],
+            "_id DESC",
+        )
+        resultado = []
+        if cursor is not None:
+            try:
+                idx_nombre = cursor.getColumnIndexOrThrow("_display_name")
+                idx_tam = cursor.getColumnIndexOrThrow("_size")
+                while cursor.moveToNext():
+                    nombre = cursor.getString(idx_nombre)
+                    tam_bytes = cursor.getLong(idx_tam)
+                    resultado.append((nombre, tam_bytes / 1024 / 1024))
+            finally:
+                cursor.close()
+        return resultado
+
     def _refrescar_descargas(self):
-        """Vuelve a leer la carpeta de Descargas y arma la lista de la
-        pestana "Mis descargas". Se llama cada vez que se entra a esa
-        pestana (no hace falta que corra sola en segundo plano)."""
+        """Vuelve a consultar la carpeta publica de Descargas y arma la
+        lista de la pestana "Mis descargas". Se llama cada vez que se entra
+        a esa pestana (no hace falta que corra sola en segundo plano)."""
         self.lista_descargas.clear_widgets()
         try:
-            archivos = [f for f in os.listdir(self.carpeta_destino) if f.lower().endswith(".mp3")]
+            archivos = self._consultar_descargas_publicas()
         except Exception:
+            traceback.print_exc()
             archivos = []
-        archivos.sort(
-            key=lambda f: os.path.getmtime(os.path.join(self.carpeta_destino, f)),
-            reverse=True,
-        )
         hay_archivos = bool(archivos)
         self.label_descargas_vacio.opacity = 0 if hay_archivos else 1
         self.label_descargas_vacio.size_hint_y = 0 if hay_archivos else None
         self.label_descargas_vacio.height = 0 if hay_archivos else dp(50)
-        for nombre in archivos:
-            ruta = os.path.join(self.carpeta_destino, nombre)
-            try:
-                tam_mb = os.path.getsize(ruta) / 1024 / 1024
-            except Exception:
-                tam_mb = 0.0
+        for nombre, tam_mb in archivos:
             self.lista_descargas.add_widget(TarjetaDescarga(nombre, tam_mb))
+
+    def _confirmar_borrar_todo(self):
+        """Antes de borrar archivos de verdad (irreversible), pide
+        confirmacion con un popup -- no hay forma de deshacer esto."""
+        caja = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(14))
+        caja.add_widget(
+            Label(
+                text="¿Borrar todos los mp3 descargados?\nEsta accion no se puede deshacer.",
+                color=COLOR_TEXTO,
+                halign="center",
+                valign="middle",
+            )
+        )
+        fila_botones = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(48), spacing=dp(10))
+        boton_cancelar = BotonAccion(text="CANCELAR", color_normal=COLOR_TARJETA, color_press=COLOR_FONDO)
+        boton_borrar = BotonAccion(text="BORRAR TODO", color_normal=COLOR_ERROR, color_press=COLOR_ACENTO_OSCURO)
+        fila_botones.add_widget(boton_cancelar)
+        fila_botones.add_widget(boton_borrar)
+        caja.add_widget(fila_botones)
+
+        popup = Popup(
+            title="Confirmar borrado",
+            content=caja,
+            size_hint=(0.85, None),
+            height=dp(190),
+            separator_color=COLOR_ACENTO,
+            background_color=COLOR_FONDO,
+        )
+        boton_cancelar.bind(on_release=popup.dismiss)
+
+        def _confirmar(*_):
+            popup.dismiss()
+            self._borrar_todas_las_descargas()
+            self._refrescar_descargas()
+
+        boton_borrar.bind(on_release=_confirmar)
+        popup.open()
+
+    def _borrar_todas_las_descargas(self):
+        """Borra de verdad (libera espacio) todos los mp3 que esta app
+        publico en la carpeta de Descargas -- via MediaStore, asi
+        desaparecen tambien de cualquier otra app (reproductor de musica,
+        explorador de archivos), no solo de esta lista."""
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
+            activity = PythonActivity.mActivity
+            resolver = activity.getContentResolver()
+            resolver.delete(
+                MediaStoreDownloads.EXTERNAL_CONTENT_URI,
+                "relative_path = ?",
+                [RUTA_RELATIVA_PUBLICA],
+            )
+        except Exception:
+            traceback.print_exc()
 
     def _actualizar_estado_vacio(self):
         self.label_vacio.opacity = 0 if self.lista.children else 1
@@ -632,13 +735,15 @@ class TubeSyncMobileApp(App):
 
                 try:
                     self._publicar_en_musica(archivo)
+                    self._limpiar_temporales(archivo)
                     fila.set_estado("LISTO", COLOR_OK)
                 except Exception as e3:
-                    # El mp3 sigue estando en la carpeta propia de la app
-                    # ("Mis descargas" adentro de TubeSync Mobile), pero no
-                    # se pudo copiar a la carpeta Musica del telefono -- por
-                    # eso el aviso en vez de marcarlo como error.
-                    fila.set_estado("LISTO", COLOR_ADVERTENCIA, detalle=f"guardado solo dentro de la app: {self._resumen_error(e3)}")
+                    # No se pudo publicar en la carpeta publica de
+                    # Descargas -- se deja el archivo de trabajo como esta
+                    # (sin borrar) para no perderlo, aunque el usuario no lo
+                    # vea listado en "Mis descargas" (esa lista ahora lee
+                    # directamente de la carpeta publica).
+                    fila.set_estado("LISTO", COLOR_ADVERTENCIA, detalle=f"no se pudo guardar en Descargas: {self._resumen_error(e3)}")
 
                 fila.set_progreso(100)
             except Exception as e:
@@ -664,7 +769,7 @@ class TubeSyncMobileApp(App):
         """Paso 1: solo descargar y convertir a mp3."""
         return {
             "format": "bestaudio/best",
-            "outtmpl": os.path.join(self.carpeta_destino, "%(title)s.%(ext)s"),
+            "outtmpl": os.path.join(self.carpeta_trabajo, "%(title)s.%(ext)s"),
             "noplaylist": True,
             "ffmpeg_location": ffmpeg_path(),
             "postprocessors": [
@@ -693,28 +798,29 @@ class TubeSyncMobileApp(App):
             ydl.post_process(archivo, info)
 
     def _publicar_en_musica(self, ruta_archivo):
-        """Copia el mp3 ya terminado a la coleccion PUBLICA de Musica del
-        telefono (via MediaStore), para que aparezca en cualquier
-        reproductor de musica, en la app de Archivos, o se pueda compartir
-        por WhatsApp/etc.
+        """Mueve (no copia) el mp3 ya terminado a la carpeta PUBLICA de
+        Descargas del telefono (Download/TubeSync Mobile, via MediaStore),
+        para que aparezca en la app de Archivos, en un reproductor de
+        musica, o se pueda compartir por WhatsApp/etc.
 
-        Por que hace falta esto: carpeta_descargas() (donde arma la lista
-        de "Mis descargas" DENTRO de esta app) usa getExternalFilesDir(),
-        que es almacenamiento PRIVADO de la app -- desde Android 11 en
-        adelante ninguna otra app (ni el explorador de archivos del
-        telefono) puede ver esa carpeta. Por eso la primera version
-        guardaba el mp3 "bien" pero el usuario nunca lo encontraba fuera de
-        la app. La carpeta publica de Musica si es visible para todo el
-        mundo, y escribir ahi via MediaStore (en vez de un path de archivo
-        directo) no pide NINGUN permiso especial desde Android 10 en
-        adelante -- es, literalmente, el mecanismo que Android dejo
-        pensado para este caso exacto (guardar contenido para el usuario
-        sin permisos de almacenamiento amplios)."""
+        Por que hace falta esto: el archivo lo arma yt-dlp/ffmpeg en
+        carpeta_trabajo(), que es almacenamiento PRIVADO de la app -- desde
+        Android 11 en adelante ninguna otra app (ni el explorador de
+        archivos del telefono) puede ver esa carpeta. La carpeta PUBLICA de
+        Descargas si es visible para todo el mundo, y escribir ahi via
+        MediaStore (en vez de un path de archivo directo) no pide NINGUN
+        permiso especial desde Android 10 en adelante -- es, literalmente,
+        el mecanismo que Android dejo pensado para este caso exacto
+        (guardar contenido para el usuario sin permisos de almacenamiento
+        amplios). Es un "mover" y no un "copiar": el llamador borra el
+        archivo de trabajo despues de que esto termine bien (ver
+        _limpiar_temporales), asi no queda duplicado ocupando el doble de
+        espacio."""
         from jnius import autoclass
 
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         ContentValues = autoclass("android.content.ContentValues")
-        MediaStoreAudioMedia = autoclass("android.provider.MediaStore$Audio$Media")
+        MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
         activity = PythonActivity.mActivity
         resolver = activity.getContentResolver()
 
@@ -723,10 +829,10 @@ class TubeSyncMobileApp(App):
         valores = ContentValues()
         valores.put("_display_name", nombre_archivo)
         valores.put("mime_type", "audio/mpeg")
-        valores.put("relative_path", "Music/TubeSync Mobile")
+        valores.put("relative_path", RUTA_RELATIVA_PUBLICA)
         valores.put("is_pending", 1)
 
-        uri_nuevo = resolver.insert(MediaStoreAudioMedia.EXTERNAL_CONTENT_URI, valores)
+        uri_nuevo = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, valores)
         if uri_nuevo is None:
             raise RuntimeError("ContentResolver.insert() en MediaStore devolvio null")
 
@@ -744,6 +850,26 @@ class TubeSyncMobileApp(App):
         valores_final = ContentValues()
         valores_final.put("is_pending", 0)
         resolver.update(uri_nuevo, valores_final, None, None)
+
+    @staticmethod
+    def _limpiar_temporales(ruta_archivo):
+        """Borra el mp3 de trabajo (y cualquier archivo que haya quedado al
+        lado con el mismo nombre -- por ejemplo una caratula suelta si el
+        paso de metadatos fallo a mitad de camino) una vez que ya quedo
+        publicado en la carpeta publica de Descargas. Sin esto, cada
+        descarga quedaria duplicada (una copia aca + una en Descargas)."""
+        base, _ext = os.path.splitext(ruta_archivo)
+        carpeta = os.path.dirname(ruta_archivo)
+        nombre_base = os.path.basename(base)
+        try:
+            for nombre in os.listdir(carpeta):
+                if os.path.splitext(nombre)[0] == nombre_base:
+                    try:
+                        os.remove(os.path.join(carpeta, nombre))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     def _hook_progreso(self, fila):
         def hook(d):
