@@ -384,25 +384,59 @@ class TubeSyncMobileApp(App):
             traceback.print_exc()
 
     # --- Descarga, una por una (mismo criterio simple que una cola FIFO) ---
+    #
+    # Se hace en DOS pasos separados a proposito:
+    #   1) Descargar + convertir a mp3 (FFmpegExtractAudio). Si esto anda,
+    #      ya queda un archivo de audio usable pase lo que pase despues.
+    #   2) Agregar metadatos y caratula (FFmpegMetadata + EmbedThumbnail),
+    #      por separado y a "mejor esfuerzo": si este paso falla por lo que
+    #      sea, el mp3 del paso 1 NO se pierde ni se borra -- la fila queda
+    #      en "listo" igual, solo que sin caratula, en vez de mostrar un
+    #      error y no dejar ningun archivo (como pasaba antes, cuando los
+    #      3 postprocesos corrian como una sola operacion atomica).
 
     def _worker(self):
         while True:
             link, fila = self.cola.get()
             try:
                 fila.set_mensaje("preparando descarga...")
-                opciones = self._opciones_ydl(fila)
+                opciones = self._opciones_descarga(fila)
                 with yt_dlp.YoutubeDL(opciones) as ydl:
-                    ydl.download([link])
+                    info = ydl.extract_info(link, download=True)
+
+                archivo = info.get("filepath") or info.get("_filename")
+
+                try:
+                    fila.set_mensaje("agregando metadatos y caratula...")
+                    self._agregar_metadatos_y_caratula(archivo, info)
+                    fila.set_mensaje("listo", color=COLOR_OK)
+                except Exception as e2:
+                    # El audio ya esta guardado (paso 1 OK) -- esto solo
+                    # afecta metadatos/caratula, no es un error fatal.
+                    fila.set_mensaje(f"listo, pero sin caratula/metadatos: {self._resumen_error(e2)}", color=COLOR_OK)
+
                 fila.set_progreso(100)
-                fila.set_mensaje("listo", color=COLOR_OK)
             except Exception as e:
                 fila.set_progreso(0)
-                detalle = str(e) or e.__class__.__name__
-                fila.set_mensaje(f"error: {detalle}", color=COLOR_ERROR)
+                fila.set_mensaje(f"error: {self._resumen_error(e)}", color=COLOR_ERROR)
             finally:
                 self.cola.task_done()
 
-    def _opciones_ydl(self, fila):
+    @staticmethod
+    def _resumen_error(e):
+        """Mensaje de error + archivo:linea exacto de donde salto, para
+        poder diagnosticar un fallo sin tener que reproducirlo -- la fila
+        de la app solo tiene lugar para una linea de texto, asi que esto
+        es deliberadamente compacto."""
+        detalle = str(e) or e.__class__.__name__
+        ultimo = traceback.extract_tb(e.__traceback__)
+        if ultimo:
+            cuadro = ultimo[-1]
+            detalle += f" [{os.path.basename(cuadro.filename)}:{cuadro.lineno}]"
+        return detalle
+
+    def _opciones_descarga(self, fila):
+        """Paso 1: solo descargar y convertir a mp3."""
         return {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(self.carpeta_destino, "%(title)s.%(ext)s"),
@@ -410,8 +444,6 @@ class TubeSyncMobileApp(App):
             "ffmpeg_location": ffmpeg_path(),
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"},
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail"},
             ],
             "writethumbnail": True,
             "quiet": True,
@@ -419,6 +451,21 @@ class TubeSyncMobileApp(App):
             "progress_hooks": [self._hook_progreso(fila)],
             "postprocessor_hooks": [self._hook_postproceso(fila)],
         }
+
+    def _agregar_metadatos_y_caratula(self, archivo, info):
+        """Paso 2 (a mejor esfuerzo): metadatos + caratula sobre el mp3 que
+        ya genero el paso 1."""
+        opciones = {
+            "quiet": True,
+            "no_warnings": True,
+            "ffmpeg_location": ffmpeg_path(),
+            "postprocessors": [
+                {"key": "FFmpegMetadata"},
+                {"key": "EmbedThumbnail"},
+            ],
+        }
+        with yt_dlp.YoutubeDL(opciones) as ydl:
+            ydl.post_process(archivo, info)
 
     def _hook_progreso(self, fila):
         def hook(d):
