@@ -31,13 +31,29 @@ jobs:
           restore-keys: |
             buildozer-
 
-      - name: Fijar Java 17 (el runner trae varias JDK instaladas y JAVA_HOME
-          apuntaba a la 11 -- instalar el paquete con apt no alcanza porque
-          no cambia esa variable; setup-java si la fija para el resto del job)
+      # El runner trae varias JDK instaladas y JAVA_HOME apuntaba a la 11 --
+      # instalar el paquete con apt no alcanza porque no cambia esa
+      # variable; setup-java si la fija para el resto del job.
+      - name: Fijar Java 17
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
+
+      # Cada corrida de GitHub Actions arranca en una maquina nueva: si no
+      # existe ~/.android/debug.keystore, Gradle genera uno AL AZAR para
+      # firmar el build debug. Eso significa que cada build quedaria firmado
+      # con una clave distinta, y Android se niega a instalar un APK encima
+      # de uno anterior si la firma no coincide ("conflicto con un
+      # paquete"). Usamos siempre el mismo keystore (committeado en el
+      # repo, ci/debug.keystore -- es un keystore de DEBUG, no secreto, con
+      # el alias/password estandar "androiddebugkey"/"android") para que
+      # todos los builds queden firmados igual y se puedan instalar unos
+      # sobre otros sin desinstalar antes.
+      - name: Instalar keystore de debug fijo
+        run: |
+          mkdir -p ~/.android
+          cp ci/debug.keystore ~/.android/debug.keystore
 
       - name: Instalar dependencias del sistema
         run: |
