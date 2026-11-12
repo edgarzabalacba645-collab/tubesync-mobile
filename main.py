@@ -625,11 +625,20 @@ class TubeSyncMobileApp(App):
                 try:
                     fila.set_estado("PROCESANDO", COLOR_INFO, detalle="agregando metadatos y caratula...")
                     self._agregar_metadatos_y_caratula(archivo, info)
-                    fila.set_estado("LISTO", COLOR_OK)
                 except Exception as e2:
                     # El audio ya esta guardado (paso 1 OK) -- esto solo
                     # afecta metadatos/caratula, no es un error fatal.
-                    fila.set_estado("LISTO", COLOR_ADVERTENCIA, detalle=f"sin caratula/metadatos: {self._resumen_error(e2)}")
+                    fila.set_estado("PROCESANDO", COLOR_ADVERTENCIA, detalle=f"sin caratula/metadatos: {self._resumen_error(e2)}")
+
+                try:
+                    self._publicar_en_musica(archivo)
+                    fila.set_estado("LISTO", COLOR_OK)
+                except Exception as e3:
+                    # El mp3 sigue estando en la carpeta propia de la app
+                    # ("Mis descargas" adentro de TubeSync Mobile), pero no
+                    # se pudo copiar a la carpeta Musica del telefono -- por
+                    # eso el aviso en vez de marcarlo como error.
+                    fila.set_estado("LISTO", COLOR_ADVERTENCIA, detalle=f"guardado solo dentro de la app: {self._resumen_error(e3)}")
 
                 fila.set_progreso(100)
             except Exception as e:
@@ -682,6 +691,59 @@ class TubeSyncMobileApp(App):
         }
         with yt_dlp.YoutubeDL(opciones) as ydl:
             ydl.post_process(archivo, info)
+
+    def _publicar_en_musica(self, ruta_archivo):
+        """Copia el mp3 ya terminado a la coleccion PUBLICA de Musica del
+        telefono (via MediaStore), para que aparezca en cualquier
+        reproductor de musica, en la app de Archivos, o se pueda compartir
+        por WhatsApp/etc.
+
+        Por que hace falta esto: carpeta_descargas() (donde arma la lista
+        de "Mis descargas" DENTRO de esta app) usa getExternalFilesDir(),
+        que es almacenamiento PRIVADO de la app -- desde Android 11 en
+        adelante ninguna otra app (ni el explorador de archivos del
+        telefono) puede ver esa carpeta. Por eso la primera version
+        guardaba el mp3 "bien" pero el usuario nunca lo encontraba fuera de
+        la app. La carpeta publica de Musica si es visible para todo el
+        mundo, y escribir ahi via MediaStore (en vez de un path de archivo
+        directo) no pide NINGUN permiso especial desde Android 10 en
+        adelante -- es, literalmente, el mecanismo que Android dejo
+        pensado para este caso exacto (guardar contenido para el usuario
+        sin permisos de almacenamiento amplios)."""
+        from jnius import autoclass
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        ContentValues = autoclass("android.content.ContentValues")
+        MediaStoreAudioMedia = autoclass("android.provider.MediaStore$Audio$Media")
+        activity = PythonActivity.mActivity
+        resolver = activity.getContentResolver()
+
+        nombre_archivo = os.path.basename(ruta_archivo)
+
+        valores = ContentValues()
+        valores.put("_display_name", nombre_archivo)
+        valores.put("mime_type", "audio/mpeg")
+        valores.put("relative_path", "Music/TubeSync Mobile")
+        valores.put("is_pending", 1)
+
+        uri_nuevo = resolver.insert(MediaStoreAudioMedia.EXTERNAL_CONTENT_URI, valores)
+        if uri_nuevo is None:
+            raise RuntimeError("ContentResolver.insert() en MediaStore devolvio null")
+
+        flujo_salida = resolver.openOutputStream(uri_nuevo)
+        try:
+            with open(ruta_archivo, "rb") as f:
+                while True:
+                    bloque = f.read(256 * 1024)
+                    if not bloque:
+                        break
+                    flujo_salida.write(bloque)
+        finally:
+            flujo_salida.close()
+
+        valores_final = ContentValues()
+        valores_final.put("is_pending", 0)
+        resolver.update(uri_nuevo, valores_final, None, None)
 
     def _hook_progreso(self, fila):
         def hook(d):
