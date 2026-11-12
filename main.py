@@ -32,10 +32,13 @@ Diferencias con la version de Windows (y por que):
   yt-dlp, se fuerza a Python a usar el paquete "certifi" (una copia de los
   certificados raiz mas comunes) como fuente de confianza.
 
-Los archivos finales quedan en una carpeta propia de la app (no hace falta
-pedir permisos de almacenamiento en ningun Android): se puede ver la ruta
-exacta abajo de todo en la pantalla de la app, o con cualquier explorador
-de archivos navegando a Android/data/<paquete>/files/Descargas.
+Los archivos finales quedan en la carpeta PUBLICA de Descargas del
+telefono, adentro de una subcarpeta propia (Descargas/TubeSync Mobile) --
+visibles para cualquier explorador de archivos o reproductor de musica,
+sin tener que pedir permisos de almacenamiento en ningun Android (se
+publican via MediaStore, ver _publicar_en_musica). No queda ninguna copia
+duplicada: el archivo de trabajo temporal se borra apenas termina de
+publicarse.
 """
 import os
 
@@ -722,8 +725,7 @@ class TubeSyncMobileApp(App):
                 opciones = self._opciones_descarga(fila)
                 with yt_dlp.YoutubeDL(opciones) as ydl:
                     info = ydl.extract_info(link, download=True)
-
-                archivo = info.get("filepath") or info.get("_filename")
+                    archivo = self._ruta_mp3_final(ydl, info)
 
                 try:
                     fila.set_estado("PROCESANDO", COLOR_INFO, detalle="agregando metadatos y caratula...")
@@ -733,18 +735,16 @@ class TubeSyncMobileApp(App):
                     # afecta metadatos/caratula, no es un error fatal.
                     fila.set_estado("PROCESANDO", COLOR_ADVERTENCIA, detalle=f"sin caratula/metadatos: {self._resumen_error(e2)}")
 
-                try:
-                    self._publicar_en_musica(archivo)
-                    self._limpiar_temporales(archivo)
-                    fila.set_estado("LISTO", COLOR_OK)
-                except Exception as e3:
-                    # No se pudo publicar en la carpeta publica de
-                    # Descargas -- se deja el archivo de trabajo como esta
-                    # (sin borrar) para no perderlo, aunque el usuario no lo
-                    # vea listado en "Mis descargas" (esa lista ahora lee
-                    # directamente de la carpeta publica).
-                    fila.set_estado("LISTO", COLOR_ADVERTENCIA, detalle=f"no se pudo guardar en Descargas: {self._resumen_error(e3)}")
-
+                # A proposito SIN try/except propio: si publicar en
+                # Descargas falla, el usuario NO tiene el tema en el
+                # telefono (el archivo de trabajo queda en una carpeta
+                # privada que no puede abrir), asi que eso es un fallo
+                # real y tiene que verse como tal -- cae al "ERROR" del
+                # except de abajo (chip rojo), nunca como un "LISTO" con
+                # matices que se puedan confundir con un exito.
+                self._publicar_en_musica(archivo)
+                self._limpiar_temporales(archivo)
+                fila.set_estado("LISTO", COLOR_OK)
                 fila.set_progreso(100)
             except Exception as e:
                 fila.set_progreso(0)
@@ -764,6 +764,30 @@ class TubeSyncMobileApp(App):
             cuadro = ultimo[-1]
             detalle += f" [{os.path.basename(cuadro.filename)}:{cuadro.lineno}]"
         return detalle
+
+    @staticmethod
+    def _ruta_mp3_final(ydl, info):
+        """Encuentra la ruta real del mp3 que dejo el paso 1 (descarga +
+        FFmpegExtractAudio). info.get("filepath")/info.get("_filename")
+        a veces viene vacio (NoneType) segun el video -- esa fue la causa
+        real de "expected str, bytes or os.PathLike object, not
+        NoneType" que vio Edgar: ese None llegaba intacto hasta
+        os.path.* en _publicar_en_musica/_limpiar_temporales y explotaba
+        ahi. Por eso primero se valida que el campo realmente apunte a
+        un archivo que existe, y si no, se reconstruye el nombre a mano
+        a partir de la plantilla de salida (outtmpl) cambiando la
+        extension a .mp3, que es siempre lo que deja FFmpegExtractAudio
+        en el disco."""
+        candidato = info.get("filepath") or info.get("_filename")
+        if candidato and os.path.isfile(candidato):
+            return candidato
+
+        base = ydl.prepare_filename(info)
+        candidato = os.path.splitext(base)[0] + ".mp3"
+        if os.path.isfile(candidato):
+            return candidato
+
+        raise FileNotFoundError(f"no se encontro el mp3 convertido (se probo: {candidato!r})")
 
     def _opciones_descarga(self, fila):
         """Paso 1: solo descargar y convertir a mp3."""
