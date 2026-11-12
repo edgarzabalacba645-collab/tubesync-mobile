@@ -58,6 +58,7 @@ except Exception:
     pass
 
 import queue
+import sys
 import threading
 import traceback
 
@@ -128,6 +129,30 @@ def carpeta_descargas():
     carpeta = os.path.join(base, "Descargas")
     os.makedirs(carpeta, exist_ok=True)
     return carpeta
+
+
+def asegurar_stdio():
+    """Causa real de "error: 'str' object has no attribute 'write'": una
+    app empaquetada para Android no tiene consola, y en este armado
+    sys.stdout/sys.stderr quedan en un estado que no es un stream valido.
+    yt-dlp escribe ahi internamente para sus propios avisos (la funcion
+    write_string de yt_dlp/utils/_utils.py) AUNQUE se le pase quiet=True --
+    y si sys.stderr no tiene un .write() que funcione, yt-dlp explota antes
+    de poder descargar un solo byte.
+
+    La solucion es simplemente darle a Python un sys.stdout/sys.stderr que
+    SI funcionen: un archivo de log real, al lado de la carpeta de
+    descargas. De paso, ese archivo sirve como registro para diagnosticar
+    cualquier otro problema a futuro (se puede mandar por WhatsApp/Drive
+    como cualquier otro archivo)."""
+    try:
+        carpeta = carpeta_descargas()
+        log_path = os.path.join(os.path.dirname(carpeta), "tubesync.log")
+        log_file = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+        sys.stdout = log_file
+        sys.stderr = log_file
+    except Exception:
+        pass
 
 
 _NOMBRES_POSTPROCESO = {
@@ -264,6 +289,7 @@ class TubeSyncMobileApp(App):
     title = "TubeSync Mobile"
 
     def build(self):
+        asegurar_stdio()
         self.cola = queue.Queue()
         self.carpeta_destino = carpeta_descargas()
 
