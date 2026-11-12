@@ -1,12 +1,27 @@
 """Recipe de python-for-android para empaquetar ffmpeg en la app Android.
 
-Este recipe NO compila nada: el binario de ffmpeg para Android (arm64-v8a)
-ya viene compilado, al lado de este archivo (ffmpeg-arm64-v8a, ~15MB). Viene
-de https://github.com/hzw1199/Android-FFmpeg-Prebuilt (licencia LGPL v2.1+,
-ver THIRD_PARTY_LICENSES/ en la raiz del repo), compilado con el NDK de
-Android (interprete /system/bin/linker64, enlazado contra las librerias
-propias de Android: libc.so, libm.so, etc. -- NO es un binario de Linux de
-escritorio, es un ejecutable real pensado para correr en el telefono).
+Este recipe NO compila ffmpeg -- solo lo COPIA. El binario real (ya
+compilado para arm64-v8a) lo deja ahi, al lado de este archivo
+(ffmpeg-arm64-v8a), un paso ANTERIOR del workflow de GitHub Actions
+("Compilar ffmpeg con soporte MP3 (libmp3lame)", en build-apk.yml), asi que
+ese archivo NO esta commiteado en git -- se genera en cada corrida (con
+cache, ver el workflow) justo antes de "buildozer android debug".
+
+Por que se compila ffmpeg desde cero en vez de usar un binario ya hecho de
+internet (como se hacia antes, con https://github.com/hzw1199/Android-FFmpeg-Prebuilt):
+ese binario prearmado estaba compilado con `--disable-gpl`, lo que significa
+que NO tenia ningun codificador de MP3 (el unico codificador de MP3 que
+existe, libmp3lame, requiere `--enable-gpl`) -- por eso las descargas
+fallaban con "Encoder not found" aunque todo lo demas (certificados,
+sys.stdout/stderr, etc.) ya estaba arreglado. La solucion es compilar
+nuestro propio ffmpeg con libmp3lame incluido (ver THIRD_PARTY_LICENSES/
+en la raiz del repo para la licencia -- este build es GPL v2+, no LGPL).
+
+El binario resultante es igual de "real" que el anterior: compilado con el
+NDK de Android (interprete /system/bin/linker64, enlazado contra las
+librerias propias de Android: libc.so, libm.so, etc. -- NO es un binario de
+Linux de escritorio, es un ejecutable real pensado para correr en el
+telefono).
 
 Por que se llama "libffmpeg.so" en vez de "ffmpeg"
 ---------------------------------------------------
@@ -41,8 +56,8 @@ _AQUI = os.path.dirname(os.path.abspath(__file__))
 
 
 class FfmpegBinRecipe(Recipe):
-    version = "9.0"
-    url = None  # no hay nada que descargar, el binario ya esta en este mismo repo
+    version = "7.1-lame3.100"
+    url = None  # no hay nada que descargar aca -- ver el workflow de CI
 
     def should_build(self, arch):
         # Es una simple copia de archivo -- siempre rapido, siempre se re-hace.
@@ -50,6 +65,15 @@ class FfmpegBinRecipe(Recipe):
 
     def build_arch(self, arch):
         origen = os.path.join(_AQUI, "ffmpeg-arm64-v8a")
+        if not os.path.isfile(origen):
+            raise FileNotFoundError(
+                f"No esta el binario de ffmpeg compilado en {origen}. "
+                "Este archivo lo tiene que generar el paso 'Compilar ffmpeg "
+                "con soporte MP3 (libmp3lame)' del workflow de GitHub "
+                "Actions ANTES de 'buildozer android debug' -- no esta "
+                "commiteado en git a proposito (se genera y se cachea en "
+                "cada corrida)."
+            )
         libs_dir = self.ctx.get_libs_dir(arch.arch)
         os.makedirs(libs_dir, exist_ok=True)
         destino = os.path.join(libs_dir, "libffmpeg.so")

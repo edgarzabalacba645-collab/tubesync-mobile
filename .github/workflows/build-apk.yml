@@ -68,6 +68,149 @@ jobs:
           pip3 install --upgrade pip
           pip3 install --upgrade buildozer
 
+      # ------------------------------------------------------------------
+      # Por que compilamos ffmpeg nosotros mismos en vez de usar un binario
+      # ya hecho (como se hacia antes, bajado de
+      # github.com/hzw1199/Android-FFmpeg-Prebuilt):
+      #
+      # Ese binario prearmado estaba compilado con "--disable-gpl", y
+      # resulta que el UNICO codificador de MP3 que existe (libmp3lame)
+      # justamente requiere "--enable-gpl" para activarse. Por eso la app
+      # bajaba el audio bien pero fallaba siempre al convertirlo a mp3, con
+      # el error "Encoder not found" (el error real quedaba tapado antes por
+      # otro bug de sys.stderr, ya arreglado, que lo convertia en el
+      # confuso "'str' object has no attribute 'write'").
+      #
+      # La solucion es compilar ffmpeg desde las fuentes oficiales
+      # (ffmpeg.org) con libmp3lame estatico adentro. Se cachea el
+      # resultado (ligado a las versiones de ffmpeg/lame/NDK de mas abajo)
+      # para que esto NO se recompile en cada build -- solo tarda unos
+      # minutos la primera vez (o cuando se cambien esas versiones).
+      # ------------------------------------------------------------------
+      - name: Ubicar el NDK de Android (ya viene instalado en el runner)
+        run: |
+          set -e
+          NDK_ROOT="$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d -name '25.*' 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$NDK_ROOT" ]; then
+            NDK_ROOT="$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -1)"
+          fi
+          if [ -z "$NDK_ROOT" ]; then
+            echo "No se encontro ningun NDK preinstalado en el runner, bajando NDK r25b..."
+            curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
+            unzip -q /tmp/ndk.zip -d "$HOME/ndk-descargado"
+            NDK_ROOT="$HOME/ndk-descargado/android-ndk-r25b"
+          fi
+          echo "Usando NDK en: $NDK_ROOT"
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Cachear ffmpeg+libmp3lame compilados (para no recompilar en cada build)
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg-cache
+          key: ffmpeg-7.1-lame-3.100-android-api24-arm64-v8a-v1
+
+      - name: Compilar ffmpeg con soporte MP3 (libmp3lame)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          API=24
+          TARGET=aarch64-linux-android
+          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
+          CC="$TOOLCHAIN/bin/${TARGET}${API}-clang"
+          CXX="$TOOLCHAIN/bin/${TARGET}${API}-clang++"
+          AR="$TOOLCHAIN/bin/llvm-ar"
+          RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          STRIP="$TOOLCHAIN/bin/llvm-strip"
+          NM="$TOOLCHAIN/bin/llvm-nm"
+
+          WORK="$HOME/ffmpeg-build"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          echo "=== Descargando LAME 3.100 ==="
+          curl -fsSL -o lame.tar.gz https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+          tar xzf lame.tar.gz
+          cd lame-3.100
+          LAME_PREFIX="$WORK/lame-install"
+          ./configure \
+            --host=$TARGET \
+            --prefix="$LAME_PREFIX" \
+            --disable-shared --enable-static \
+            --disable-frontend \
+            --with-pic \
+            CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP" \
+            CFLAGS="-O2 -fPIC"
+          make -j"$(nproc)"
+          make install
+          cd "$WORK"
+
+          echo "=== Descargando FFmpeg 7.1 ==="
+          curl -fsSL -o ffmpeg.tar.bz2 https://ffmpeg.org/releases/ffmpeg-7.1.tar.bz2
+          tar xjf ffmpeg.tar.bz2
+          cd ffmpeg-7.1
+
+          ./configure \
+            --target-os=android \
+            --arch=aarch64 \
+            --cpu=armv8-a \
+            --cc="$CC" \
+            --cxx="$CXX" \
+            --ar="$AR" \
+            --ranlib="$RANLIB" \
+            --strip="$STRIP" \
+            --nm="$NM" \
+            --cross-prefix="$TOOLCHAIN/bin/${TARGET}-" \
+            --sysroot="$TOOLCHAIN/sysroot" \
+            --enable-cross-compile \
+            --enable-static --disable-shared \
+            --enable-small \
+            --enable-gpl --enable-version3 \
+            --enable-libmp3lame \
+            --extra-cflags="-O2 -fPIC -I$LAME_PREFIX/include" \
+            --extra-ldflags="-L$LAME_PREFIX/lib" \
+            --enable-jni --enable-mediacodec \
+            --enable-avdevice --enable-avcodec --enable-avformat --enable-avutil \
+            --enable-swresample --enable-swscale --enable-avfilter \
+            --enable-network --enable-protocols --enable-encoders --enable-decoders \
+            --enable-hwaccels --enable-muxers --enable-demuxers --enable-parsers \
+            --enable-bsfs --enable-filters \
+            --enable-ffmpeg --disable-ffplay --disable-ffprobe \
+            --disable-doc --disable-debug \
+            2>&1 | tee /tmp/ffmpeg-configure.log
+
+          # Chequeo explicito: si por lo que sea libmp3lame no quedo
+          # habilitado, mejor frenar aca con un error claro que descubrirlo
+          # mas tarde en el telefono otra vez.
+          if ! grep -qi "libmp3lame" /tmp/ffmpeg-configure.log; then
+            echo "ERROR: libmp3lame no aparece en el resumen de ./configure -- revisar el log de arriba."
+            exit 1
+          fi
+
+          make -j"$(nproc)"
+
+          mkdir -p ~/ffmpeg-cache
+          cp ffmpeg ~/ffmpeg-cache/ffmpeg-arm64-v8a
+          "$STRIP" ~/ffmpeg-cache/ffmpeg-arm64-v8a || true
+          chmod 755 ~/ffmpeg-cache/ffmpeg-arm64-v8a
+
+      - name: Verificar que el ffmpeg compilado sepa codificar MP3
+        run: |
+          set -e
+          test -f ~/ffmpeg-cache/ffmpeg-arm64-v8a
+          echo "Tamano del binario:"
+          ls -lh ~/ffmpeg-cache/ffmpeg-arm64-v8a
+          if ! strings ~/ffmpeg-cache/ffmpeg-arm64-v8a | grep -q "^libmp3lame$"; then
+            echo "ERROR: el binario compilado no tiene libmp3lame adentro."
+            exit 1
+          fi
+          echo "OK: libmp3lame esta presente en el binario."
+
+      - name: Copiar ffmpeg compilado al recipe de python-for-android
+        run: |
+          cp ~/ffmpeg-cache/ffmpeg-arm64-v8a recipes/ffmpeg_bin/ffmpeg-arm64-v8a
+          chmod 755 recipes/ffmpeg_bin/ffmpeg-arm64-v8a
+
       - name: Compilar con Buildozer
         run: |
           yes | buildozer -v android debug

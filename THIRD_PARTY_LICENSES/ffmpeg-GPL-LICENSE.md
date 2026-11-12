@@ -2,8 +2,17 @@
 
 ## This Build
 
-This build is compiled with `--disable-gpl --disable-nonfree`, therefore it is
-licensed under **LGPL v2.1+** only. No GPL or non-free components are included.
+This build is compiled from the official FFmpeg source (ffmpeg.org) with
+`--enable-gpl --enable-version3 --enable-libmp3lame`, so that it can actually
+encode MP3 audio (the previous build in this repo, from a different
+pre-compiled binary, had `--disable-gpl` and turned out to have **no MP3
+encoder at all** -- `libmp3lame` requires `--enable-gpl`, which is why
+downloads were failing with "Encoder not found"). Because of `--enable-gpl`,
+this build's license is **GPL v2+** (see below), not LGPL.
+
+It statically links LAME (`libmp3lame`), which is licensed under the
+**GNU Lesser General Public License v2+ (LGPL v2+)** -- see
+`https://lame.sourceforge.io/license.txt` for LAME's own license text.
 
 ---
 

@@ -35,9 +35,10 @@ ruta completa abajo de todo en la pantalla.
 - **ffmpeg SI es un binario real** (como ffmpeg.exe), pero compilado para
   Android y empaquetado con un truco especifico para que Android lo deje
   ejecutar (ver el docstring completo en `recipes/ffmpeg_bin/__init__.py`).
-  El binario viene de [hzw1199/Android-FFmpeg-Prebuilt](https://github.com/hzw1199/Android-FFmpeg-Prebuilt)
-  (licencia LGPL v2.1+, sin partes GPL/no-libres -- ver
-  `THIRD_PARTY_LICENSES/ffmpeg-LGPL-LICENSE.md`).
+  El binario se compila desde las fuentes oficiales de ffmpeg.org en cada
+  build de GitHub Actions (con libmp3lame estatico adentro, asi puede
+  codificar MP3 -- ver `THIRD_PARTY_LICENSES/ffmpeg-GPL-LICENSE.md` para la
+  licencia, GPL v2+ por el `--enable-gpl` que requiere libmp3lame).
 - Por ahora **solo audio** (no video) -- es el uso real que se le va a dar
   desde el celular.
 - Por ahora no tiene el boton de "actualizar yt-dlp" que tiene la version de

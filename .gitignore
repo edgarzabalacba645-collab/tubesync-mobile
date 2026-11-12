@@ -6,3 +6,4 @@ __pycache__/
 .venv/
 _descargas_dev/
 *.apk
+recipes/ffmpeg_bin/ffmpeg-arm64-v8a
