@@ -236,12 +236,24 @@ jobs:
         run: |
           set -e
           encontrados=0
+          # "dists": la carpeta armada final que python-for-android venia
+          # reutilizando sin chequear nada (la causa de este fix).
+          #
+          # "build/venv": el venv que python-for-android usa para instalar
+          # con pip los paquetes puramente-Python (yt-dlp, certifi,
+          # mutagen). Como el atajo de arriba hacia que este paso TAMPOCO
+          # se ejecutara desde hace varios builds, quedo un venv viejo con
+          # un pip roto (mezcla de versiones -- "ImportError:
+          # open_rich_spinner"), descubierto recien ahora que lo forzamos a
+          # correr de nuevo. Se borra por la misma razon: que se rehaga de
+          # cero, es rapido (solo paquetes puros de Python, no hay nada de
+          # C/NDK para recompilar aca).
           while IFS= read -r -d '' carpeta; do
-            echo "Borrando dist viejo: $carpeta"
+            echo "Borrando carpeta de build vieja: $carpeta"
             rm -rf "$carpeta"
             encontrados=$((encontrados + 1))
-          done < <(find . "$HOME/.buildozer" -type d -name "dists" -print0 2>/dev/null)
-          echo "Carpetas 'dists' borradas: $encontrados"
+          done < <(find . "$HOME/.buildozer" -type d \( -name "dists" -o -path "*/build/venv" \) -print0 2>/dev/null)
+          echo "Carpetas borradas: $encontrados"
 
       - name: Compilar con Buildozer
         run: |
