@@ -211,6 +211,38 @@ jobs:
           cp ~/ffmpeg-cache/ffmpeg-arm64-v8a recipes/ffmpeg_bin/ffmpeg-arm64-v8a
           chmod 755 recipes/ffmpeg_bin/ffmpeg-arm64-v8a
 
+      # ------------------------------------------------------------------
+      # BUG ENCONTRADO (build #12): python-for-android arma una carpeta
+      # "dist" una sola vez y despues la reutiliza en TODOS los builds
+      # siguientes con solo mirar que la LISTA DE NOMBRES de recipes sea la
+      # misma -- sin mirar el contenido ni la version de cada recipe. nuestro
+      # recipe de ffmpeg_bin esta escrito para "siempre rehacerse" (deberia
+      # recopiar el binario en cada build), pero si ya existe un dist
+      # "compatible" (mismos nombres de recipe que la vez anterior),
+      # python-for-android ni siquiera llega a preguntarle al recipe si hay
+      # que reconstruir: reusa el dist entero tal cual quedo la primera vez.
+      # Confirmado con un build real: el ffmpeg del build #12 (que debia
+      # tener el codificador de mp3 nuevo) resulto ser BYTE POR BYTE igual
+      # al binario viejo sin mp3 -- quedo pegado desde el primer build
+      # cacheado.
+      #
+      # La solucion es borrar esa carpeta "dists" antes de compilar, para
+      # forzar a que la arme de nuevo (lo cual SI dispara el should_build()
+      # de cada recipe -- la compilacion pesada de python/kivy/sdl2/etc
+      # sigue cacheada aparte y no se rehace, esto solo repite el paso final
+      # de "armar el dist" con lo que haya cambiado).
+      # ------------------------------------------------------------------
+      - name: Forzar que python-for-android rearme el "dist" (si no, reusa uno viejo y ningun cambio de recipe se aplica)
+        run: |
+          set -e
+          encontrados=0
+          while IFS= read -r -d '' carpeta; do
+            echo "Borrando dist viejo: $carpeta"
+            rm -rf "$carpeta"
+            encontrados=$((encontrados + 1))
+          done < <(find . "$HOME/.buildozer" -type d -name "dists" -print0 2>/dev/null)
+          echo "Carpetas 'dists' borradas: $encontrados"
+
       - name: Compilar con Buildozer
         run: |
           yes | buildozer -v android debug
