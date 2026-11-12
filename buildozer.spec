@@ -9,6 +9,13 @@ source.include_exts = py,png,jpg,kv,atlas
 
 version = 0.1
 
+# Icono propio y color de pantalla de carga (presplash) -- sin esto el
+# instalador usa el icono generico de python-for-android y una pantalla de
+# carga blanca lisa, que es justamente lo que hace que la app se sienta
+# "cruda"/sin terminar al abrirla.
+icon.filename = %(source.dir)s/icon.png
+android.presplash_color = #121218
+
 # yt-dlp: el motor de descarga (igual que en la version de Windows).
 # certifi: certificados SSL -- en Android a veces el detectado por Python
 #          no alcanza, certifi asegura que las descargas por HTTPS no fallen.
