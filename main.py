@@ -80,12 +80,14 @@ import yt_dlp
 # --- Paleta (tema oscuro, look de app moderna) ----------------------------
 COLOR_FONDO = (0.071, 0.071, 0.094, 1)        # casi negro
 COLOR_TARJETA = (0.122, 0.122, 0.153, 1)       # un poco mas claro que el fondo
-COLOR_ACENTO = (1, 0.322, 0.322, 1)            # rojo/coral (igual al icono)
+COLOR_ACENTO = (1, 0.322, 0.322, 1)            # rojo/coral (igual al icono) -- accion principal
 COLOR_ACENTO_OSCURO = (0.75, 0.2, 0.2, 1)
 COLOR_TEXTO = (0.95, 0.95, 0.96, 1)
 COLOR_TEXTO_MUTE = (0.58, 0.58, 0.63, 1)
-COLOR_OK = (0.42, 0.85, 0.55, 1)
-COLOR_ERROR = (1, 0.45, 0.45, 1)
+COLOR_INFO = (0.306, 0.804, 0.769, 1)           # turquesa -- "en progreso"
+COLOR_OK = (0.42, 0.85, 0.55, 1)                # verde -- exito completo
+COLOR_ADVERTENCIA = (0.95, 0.73, 0.25, 1)       # ambar -- listo pero con avisos
+COLOR_ERROR = (1, 0.45, 0.45, 1)                # rojo -- error
 
 Window.clearcolor = COLOR_FONDO
 
@@ -234,20 +236,134 @@ class BarraProgreso(Widget):
         self._redibujar()
 
 
+class Insignia(BoxLayout):
+    """Chip/etiqueta de estado redondeada (EN COLA / DESCARGANDO / LISTO /
+    ERROR...), como las que usan las apps modernas para mostrar un estado
+    corto de un vistazo, con su propio color segun la situacion."""
+
+    def __init__(self, **kwargs):
+        super().__init__(size_hint=(None, None), height=dp(22), padding=(dp(10), 0), **kwargs)
+        self.label = Label(
+            font_size=dp(11), bold=True, color=(1, 1, 1, 1),
+            size_hint=(None, None), height=dp(22),
+        )
+        self.label.bind(texture_size=self._on_texture_size)
+        self.add_widget(self.label)
+        with self.canvas.before:
+            self._color = Color(*COLOR_TEXTO_MUTE)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(11)])
+        self.bind(pos=self._redibujar, size=self._redibujar)
+
+    def _on_texture_size(self, inst, val):
+        inst.width = val[0]
+        self.width = val[0] + dp(20)
+
+    def _redibujar(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+    def set_estado(self, texto, color):
+        self.label.text = texto
+        self._color.rgba = color
+
+
+class BarraAcento(Widget):
+    """Tira vertical de color -- acento a la izquierda de cada item de "Mis
+    descargas", para diferenciarlo visualmente de las filas de descarga
+    activa (que usan chip + barra de progreso)."""
+
+    def __init__(self, color=COLOR_INFO, **kwargs):
+        kwargs.setdefault("size_hint_x", None)
+        kwargs.setdefault("width", dp(4))
+        super().__init__(**kwargs)
+        with self.canvas:
+            Color(*color)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(2)])
+        self.bind(pos=self._redibujar, size=self._redibujar)
+
+    def _redibujar(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+
+class BotonPestana(Button):
+    """Boton selector de pestana ("Nueva descarga" / "Mis descargas"):
+    resaltado con el color de acento cuando esta activo, apagado cuando
+    no."""
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            background_normal="", background_down="", background_color=(0, 0, 0, 0),
+            bold=True, font_size=dp(12), **kwargs,
+        )
+        self.activo = False
+        with self.canvas.before:
+            self._color_fondo = Color(*COLOR_TARJETA)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
+        self.bind(pos=self._actualizar_rect, size=self._actualizar_rect)
+        self._actualizar_estilo()
+
+    def _actualizar_rect(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+
+    def set_activo(self, activo):
+        self.activo = activo
+        self._actualizar_estilo()
+
+    def _actualizar_estilo(self):
+        if self.activo:
+            self._color_fondo.rgba = COLOR_ACENTO
+            self.color = (1, 1, 1, 1)
+        else:
+            self._color_fondo.rgba = COLOR_TARJETA
+            self.color = COLOR_TEXTO_MUTE
+
+
+class TarjetaDescarga(Tarjeta):
+    """Un item de la pestana "Mis descargas": nombre del archivo + tamano,
+    con una tira de acento turquesa a la izquierda."""
+
+    def __init__(self, nombre_archivo, tam_mb, **kwargs):
+        super().__init__(
+            orientation="horizontal", size_hint_y=None, height=dp(58),
+            padding=(dp(12), dp(8)), spacing=dp(12), **kwargs,
+        )
+        self.add_widget(BarraAcento())
+        columna = BoxLayout(orientation="vertical", spacing=dp(2))
+        titulo = Label(
+            text=os.path.splitext(nombre_archivo)[0],
+            color=COLOR_TEXTO, font_size=dp(13), bold=True,
+            halign="left", valign="middle", shorten=True, shorten_from="right",
+            size_hint_y=None, height=dp(20),
+        )
+        titulo.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        subtitulo = Label(
+            text=f"{tam_mb:.1f} MB · MP3 320kbps",
+            color=COLOR_TEXTO_MUTE, font_size=dp(11),
+            halign="left", valign="middle",
+            size_hint_y=None, height=dp(16),
+        )
+        subtitulo.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        columna.add_widget(titulo)
+        columna.add_widget(subtitulo)
+        self.add_widget(columna)
+
+
 class FilaDescarga(Tarjeta):
-    """Una fila de la lista: el link, una barra de progreso y un mensaje de
+    """Una fila de la lista: el link, una barra de progreso y un chip de
     estado -- el mismo concepto que la cola de MediaVault en Windows, pero
-    con aspecto de tarjeta y un icono segun el estado (en cola / bajando /
-    listo / error)."""
+    con aspecto de tarjeta y un color segun la situacion (en cola / bajando
+    / listo / error)."""
 
     def __init__(self, url, **kwargs):
         super().__init__(
-            orientation="vertical", size_hint_y=None, height=dp(78), padding=(dp(14), dp(10)), spacing=dp(4), **kwargs
+            orientation="vertical", size_hint_y=None, height=dp(82), padding=(dp(14), dp(10)), spacing=dp(6), **kwargs
         )
         self.label_url = Label(
             text=url,
             size_hint_y=None,
-            height=dp(22),
+            height=dp(20),
             halign="left",
             valign="middle",
             shorten=True,
@@ -260,29 +376,32 @@ class FilaDescarga(Tarjeta):
 
         self.barra = BarraProgreso()
 
-        self.label_estado = Label(
-            text="en cola...",
-            size_hint_y=None,
-            height=dp(20),
+        fila_estado = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(22), spacing=dp(8))
+        self.insignia = Insignia()
+        self.insignia.set_estado("EN COLA", COLOR_TEXTO_MUTE)
+        self.label_detalle = Label(
+            text="",
             halign="left",
             valign="middle",
             color=COLOR_TEXTO_MUTE,
-            font_size=dp(12),
+            font_size=dp(11),
         )
-        self.label_estado.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        self.label_detalle.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        fila_estado.add_widget(self.insignia)
+        fila_estado.add_widget(self.label_detalle)
 
         self.add_widget(self.label_url)
         self.add_widget(self.barra)
-        self.add_widget(self.label_estado)
+        self.add_widget(fila_estado)
 
     @mainthread
     def set_progreso(self, valor):
         self.barra.set_valor(valor)
 
     @mainthread
-    def set_mensaje(self, texto, color=None):
-        self.label_estado.text = texto
-        self.label_estado.color = color or COLOR_TEXTO_MUTE
+    def set_estado(self, chip_texto, chip_color, detalle=""):
+        self.insignia.set_estado(chip_texto, chip_color)
+        self.label_detalle.text = detalle
 
 
 class TubeSyncMobileApp(App):
@@ -334,6 +453,22 @@ class TubeSyncMobileApp(App):
         # --- Contenido, con margen propio ---------------------------------
         contenido = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
 
+        # --- Selector de pestanas (Nueva descarga / Mis descargas) --------
+        fila_pestanas = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(8))
+        self.boton_tab_nueva = BotonPestana(text="NUEVA DESCARGA")
+        self.boton_tab_descargas = BotonPestana(text="MIS DESCARGAS")
+        self.boton_tab_nueva.bind(on_release=lambda *_: self._cambiar_pestana("nueva"))
+        self.boton_tab_descargas.bind(on_release=lambda *_: self._cambiar_pestana("descargas"))
+        fila_pestanas.add_widget(self.boton_tab_nueva)
+        fila_pestanas.add_widget(self.boton_tab_descargas)
+        contenido.add_widget(fila_pestanas)
+
+        self.area_vistas = BoxLayout(orientation="vertical")
+        contenido.add_widget(self.area_vistas)
+
+        # --- Vista "Nueva descarga" ----------------------------------------
+        self.vista_nueva = BoxLayout(orientation="vertical", spacing=dp(12))
+
         tarjeta_input = Tarjeta(orientation="vertical", size_hint_y=None, height=dp(120), padding=dp(10), color=COLOR_TARJETA)
         self.input_links = TextInput(
             hint_text="Pega uno o mas links de YouTube (uno por linea)",
@@ -347,11 +482,11 @@ class TubeSyncMobileApp(App):
             multiline=True,
         )
         tarjeta_input.add_widget(self.input_links)
-        contenido.add_widget(tarjeta_input)
+        self.vista_nueva.add_widget(tarjeta_input)
 
         boton = BotonAccion(text="DESCARGAR AUDIO", size_hint_y=None, height=dp(50), font_size=dp(15))
         boton.bind(on_release=self.agregar_links)
-        contenido.add_widget(boton)
+        self.vista_nueva.add_widget(boton)
 
         self.label_vacio = Label(
             text="Todavia no agregaste ningun link.\nPegalo arriba y toca \"Descargar audio\".",
@@ -360,15 +495,15 @@ class TubeSyncMobileApp(App):
             halign="center",
             valign="middle",
         )
-        contenido.add_widget(self.label_vacio)
+        self.vista_nueva.add_widget(self.label_vacio)
 
         self.lista = GridLayout(cols=1, size_hint_y=None, spacing=dp(10))
         self.lista.bind(minimum_height=self.lista.setter("height"))
         scroll = ScrollView()
         scroll.add_widget(self.lista)
-        contenido.add_widget(scroll)
+        self.vista_nueva.add_widget(scroll)
 
-        contenido.add_widget(
+        self.vista_nueva.add_widget(
             Label(
                 text=f"Se guardan en:\n{self.carpeta_destino}",
                 size_hint_y=None,
@@ -380,10 +515,65 @@ class TubeSyncMobileApp(App):
             )
         )
 
+        # --- Vista "Mis descargas" ------------------------------------------
+        self.vista_descargas = BoxLayout(orientation="vertical", spacing=dp(10))
+
+        self.label_descargas_vacio = Label(
+            text="Todavia no descargaste ningun audio.",
+            color=COLOR_TEXTO_MUTE,
+            font_size=dp(13),
+            halign="center",
+            valign="middle",
+        )
+        self.vista_descargas.add_widget(self.label_descargas_vacio)
+
+        self.lista_descargas = GridLayout(cols=1, size_hint_y=None, spacing=dp(10))
+        self.lista_descargas.bind(minimum_height=self.lista_descargas.setter("height"))
+        scroll_descargas = ScrollView()
+        scroll_descargas.add_widget(self.lista_descargas)
+        self.vista_descargas.add_widget(scroll_descargas)
+
         raiz.add_widget(contenido)
+
+        self._cambiar_pestana("nueva")
 
         threading.Thread(target=self._worker, daemon=True).start()
         return raiz
+
+    def _cambiar_pestana(self, nombre):
+        self.boton_tab_nueva.set_activo(nombre == "nueva")
+        self.boton_tab_descargas.set_activo(nombre == "descargas")
+        self.area_vistas.clear_widgets()
+        if nombre == "nueva":
+            self.area_vistas.add_widget(self.vista_nueva)
+        else:
+            self._refrescar_descargas()
+            self.area_vistas.add_widget(self.vista_descargas)
+
+    def _refrescar_descargas(self):
+        """Vuelve a leer la carpeta de Descargas y arma la lista de la
+        pestana "Mis descargas". Se llama cada vez que se entra a esa
+        pestana (no hace falta que corra sola en segundo plano)."""
+        self.lista_descargas.clear_widgets()
+        try:
+            archivos = [f for f in os.listdir(self.carpeta_destino) if f.lower().endswith(".mp3")]
+        except Exception:
+            archivos = []
+        archivos.sort(
+            key=lambda f: os.path.getmtime(os.path.join(self.carpeta_destino, f)),
+            reverse=True,
+        )
+        hay_archivos = bool(archivos)
+        self.label_descargas_vacio.opacity = 0 if hay_archivos else 1
+        self.label_descargas_vacio.size_hint_y = 0 if hay_archivos else None
+        self.label_descargas_vacio.height = 0 if hay_archivos else dp(50)
+        for nombre in archivos:
+            ruta = os.path.join(self.carpeta_destino, nombre)
+            try:
+                tam_mb = os.path.getsize(ruta) / 1024 / 1024
+            except Exception:
+                tam_mb = 0.0
+            self.lista_descargas.add_widget(TarjetaDescarga(nombre, tam_mb))
 
     def _actualizar_estado_vacio(self):
         self.label_vacio.opacity = 0 if self.lista.children else 1
@@ -425,7 +615,7 @@ class TubeSyncMobileApp(App):
         while True:
             link, fila = self.cola.get()
             try:
-                fila.set_mensaje("preparando descarga...")
+                fila.set_estado("PREPARANDO", COLOR_INFO)
                 opciones = self._opciones_descarga(fila)
                 with yt_dlp.YoutubeDL(opciones) as ydl:
                     info = ydl.extract_info(link, download=True)
@@ -433,18 +623,18 @@ class TubeSyncMobileApp(App):
                 archivo = info.get("filepath") or info.get("_filename")
 
                 try:
-                    fila.set_mensaje("agregando metadatos y caratula...")
+                    fila.set_estado("PROCESANDO", COLOR_INFO, detalle="agregando metadatos y caratula...")
                     self._agregar_metadatos_y_caratula(archivo, info)
-                    fila.set_mensaje("listo", color=COLOR_OK)
+                    fila.set_estado("LISTO", COLOR_OK)
                 except Exception as e2:
                     # El audio ya esta guardado (paso 1 OK) -- esto solo
                     # afecta metadatos/caratula, no es un error fatal.
-                    fila.set_mensaje(f"listo, pero sin caratula/metadatos: {self._resumen_error(e2)}", color=COLOR_OK)
+                    fila.set_estado("LISTO", COLOR_ADVERTENCIA, detalle=f"sin caratula/metadatos: {self._resumen_error(e2)}")
 
                 fila.set_progreso(100)
             except Exception as e:
                 fila.set_progreso(0)
-                fila.set_mensaje(f"error: {self._resumen_error(e)}", color=COLOR_ERROR)
+                fila.set_estado("ERROR", COLOR_ERROR, detalle=self._resumen_error(e))
             finally:
                 self.cola.task_done()
 
@@ -506,18 +696,19 @@ class TubeSyncMobileApp(App):
                     velocidad = d.get("speed")
                     if velocidad:
                         partes.append(f"(~{velocidad / 1024 / 1024:.1f}MB/s)")
-                    fila.set_mensaje(" ".join(partes))
+                    fila.set_estado("DESCARGANDO", COLOR_INFO, detalle=" ".join(partes))
                 else:
-                    fila.set_mensaje("descargando...")
+                    fila.set_estado("DESCARGANDO", COLOR_INFO)
             elif estado == "finished":
-                fila.set_mensaje("procesando audio...")
+                fila.set_estado("PROCESANDO", COLOR_INFO)
         return hook
 
     def _hook_postproceso(self, fila):
         def hook(d):
             if d.get("status") == "started":
                 nombre = d.get("postprocessor", "")
-                fila.set_mensaje(_NOMBRES_POSTPROCESO.get(nombre, f"procesando ({nombre})..."))
+                detalle = _NOMBRES_POSTPROCESO.get(nombre, f"procesando ({nombre})...")
+                fila.set_estado("PROCESANDO", COLOR_INFO, detalle=detalle)
         return hook
 
 
