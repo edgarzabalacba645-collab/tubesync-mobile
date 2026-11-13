@@ -63,6 +63,7 @@ except Exception:
 import json
 import queue
 import re
+import ssl
 import subprocess
 import sys
 import threading
@@ -189,6 +190,27 @@ _NOMBRES_POSTPROCESO = {
 _CABECERAS_HTTP = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 }
+
+# Contexto SSL para los pedidos HTTPS propios (Spotify) -- las variables de
+# entorno SSL_CERT_FILE / REQUESTS_CA_BUNDLE de mas arriba (antes de
+# "import yt_dlp") le alcanzan a yt-dlp porque yt-dlp arma su PROPIO
+# contexto SSL con certifi (yt_dlp/networking/_helper.py: ssl_load_certs),
+# sin depender de esas variables de entorno en absoluto. Un
+# urllib.request.urlopen() llamado directo (como el de _metadata_spotify /
+# _forzar_caratula, mas abajo) en cambio SI depende de que el "ssl" de
+# Python encuentre certificados raiz por su cuenta -- y en Android,
+# compilado con python-for-android, no los encuentra (no hay variables de
+# entorno que valgan para eso), asi que sin pasarle un contexto armado a
+# mano con certifi (igual que hace yt-dlp), CUALQUIER pedido HTTPS propio
+# falla en seco con CERTIFICATE_VERIFY_FAILED -- esto fue confirmado
+# reproduciendo el mismo fallo con un contexto SSL vacio contra un sitio
+# HTTPS cualquiera, y viendo que cargar un certificado raiz valido a mano
+# (via load_verify_locations) lo arregla.
+try:
+    _CONTEXTO_SSL = ssl.create_default_context()
+    _CONTEXTO_SSL.load_verify_locations(cafile=certifi.where())
+except Exception:
+    _CONTEXTO_SSL = None
 
 
 class Tarjeta(BoxLayout):
@@ -842,9 +864,10 @@ class TubeSyncMobileApp(App):
             return link, None
 
         fila.set_estado("PREPARANDO", COLOR_INFO, detalle="leyendo el tema de Spotify...")
-        titulo, artista, caratula = self._metadata_spotify(link)
+        titulo, artista, caratula, error = self._metadata_spotify(link)
         if not titulo:
-            raise RuntimeError("no se pudo leer el tema de Spotify (revisa el link)")
+            detalle = f": {error}" if error else ""
+            raise RuntimeError(f"no se pudo leer el tema de Spotify (revisa el link){detalle}")
 
         consulta = f"{artista} - {titulo}" if artista else titulo
         fila.set_estado("PREPARANDO", COLOR_INFO, detalle=f'Spotify -> buscando "{consulta}" en YouTube...')
@@ -866,23 +889,25 @@ class TubeSyncMobileApp(App):
            busqueda en YouTube es un poco menos precisa pero igual
            funciona.
 
-        Devuelve (titulo, artista_o_None, url_caratula_o_None); titulo
-        es None si ni siquiera el oEmbed respondio."""
+        Devuelve (titulo, artista_o_None, url_caratula_o_None,
+        error_o_None); titulo es None si ni siquiera el oEmbed respondio
+        (en ese caso error trae el detalle real de por que, para poder
+        mostrarlo en vez de un mensaje generico)."""
         titulo, artista, caratula = None, None, None
         try:
             url_oembed = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(link, safe="")
             peticion = urllib.request.Request(url_oembed, headers=_CABECERAS_HTTP)
-            with urllib.request.urlopen(peticion, timeout=15) as resp:
+            with urllib.request.urlopen(peticion, timeout=15, context=_CONTEXTO_SSL) as resp:
                 datos = json.loads(resp.read().decode("utf-8"))
             titulo = datos.get("title") or None
             caratula = datos.get("thumbnail_url") or None
-        except Exception:
+        except Exception as e:
             traceback.print_exc()
-            return None, None, None
+            return None, None, None, f"{type(e).__name__}: {e}"
 
         try:
             peticion = urllib.request.Request(link, headers=_CABECERAS_HTTP)
-            with urllib.request.urlopen(peticion, timeout=15) as resp:
+            with urllib.request.urlopen(peticion, timeout=15, context=_CONTEXTO_SSL) as resp:
                 html = resp.read().decode("utf-8", errors="replace")
             m = re.search(r"<title>(.*?)\s*-\s*song by\s*(.*?)\s*\|\s*Spotify</title>", html, re.IGNORECASE)
             if m:
@@ -894,7 +919,7 @@ class TubeSyncMobileApp(App):
         except Exception:
             traceback.print_exc()  # a mejor esfuerzo -- ya tenemos el titulo del oEmbed
 
-        return titulo, artista, caratula
+        return titulo, artista, caratula, None
 
     @staticmethod
     def _forzar_caratula(ruta_mp3, url_caratula):
@@ -915,7 +940,7 @@ class TubeSyncMobileApp(App):
         destino = os.path.join(carpeta, base + ".jpg")
         try:
             peticion = urllib.request.Request(url_caratula, headers=_CABECERAS_HTTP)
-            with urllib.request.urlopen(peticion, timeout=15) as resp:
+            with urllib.request.urlopen(peticion, timeout=15, context=_CONTEXTO_SSL) as resp:
                 contenido = resp.read()
         except Exception:
             traceback.print_exc()  # a mejor esfuerzo -- se sigue con la miniatura
