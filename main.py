@@ -760,6 +760,7 @@ class TubeSyncMobileApp(App):
                 opciones = self._opciones_descarga(fila)
                 with yt_dlp.YoutubeDL(opciones) as ydl:
                     info = ydl.extract_info(link_descarga, download=True)
+                    info = self._desenvolver_resultado_busqueda(info)
                     archivo = self._ruta_mp3_final(ydl, info)
 
                 if caratula_forzada:
@@ -808,6 +809,38 @@ class TubeSyncMobileApp(App):
             cuadro = ultimo[-1]
             detalle += f" [{os.path.basename(cuadro.filename)}:{cuadro.lineno}]"
         return detalle
+
+    @staticmethod
+    def _desenvolver_resultado_busqueda(info):
+        """"ytsearchN:consulta" (lo que usa _resolver_link para los links
+        de Spotify) SIEMPRE devuelve un resultado de tipo "playlist" --
+        incluso pidiendo un solo resultado (ytsearch1:) -- con el video
+        real adentro de info["entries"][0]; esto es asi en TODAS las
+        versiones de yt-dlp, por como esta armada la clase base que usan
+        internamente todos los buscadores (SearchInfoExtractor,
+        extractor/common.py: siempre llama a self.playlist_result(...)).
+
+        El diccionario de nivel superior (el "playlist") trae el texto de
+        la BUSQUEDA como titulo (no el titulo real del video que
+        matcheo), asi que _ruta_mp3_final -- que reconstruye el nombre de
+        archivo a partir del titulo cuando "filepath" no esta disponible
+        -- construye un nombre que casi nunca coincide con el que yt-dlp
+        realmente escribio en disco (ese se arma con el titulo REAL del
+        video). Confirmado reproduciendo el error exacto que vio Edgar
+        ("no se encontro el mp3 convertido") con una descarga real de
+        prueba, y confirmando que se arregla desenvolviendo "entries"
+        antes de buscar el archivo.
+
+        Si no es un resultado de busqueda (info.get("entries") es None,
+        o sea un link de YouTube pegado directo), devuelve info tal
+        cual, sin tocar nada."""
+        entradas = info.get("entries")
+        if entradas is None:
+            return info
+        entradas = list(entradas)
+        if not entradas:
+            raise RuntimeError("no se encontro ningun resultado en YouTube para esa busqueda")
+        return entradas[0]
 
     @staticmethod
     def _ruta_mp3_final(ydl, info):
