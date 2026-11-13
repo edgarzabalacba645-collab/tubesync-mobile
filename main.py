@@ -845,6 +845,14 @@ class TubeSyncMobileApp(App):
         PythonActivity = autoclass("org.kivy.android.PythonActivity")
         ContentValues = autoclass("android.content.ContentValues")
         MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
+        # ContentValues.put() tiene MUCHAS firmas sobrecargadas que aceptan un
+        # numero (Integer, Long, Short, Byte, Float, Double...). Pasarle un
+        # int de Python asi nomas (valores.put("is_pending", 1)) es AMBIGUO
+        # para pyjnius -- no sabe a cual firma Java llamar y tira un error de
+        # "ambiguous overload" (el error en rojo que vio Edgar en el build
+        # anterior). Forzando el boxeo a java.lang.Integer explicitamente se
+        # elimina la ambiguedad: solo matchea una firma posible.
+        Integer = autoclass("java.lang.Integer")
         activity = PythonActivity.mActivity
         resolver = activity.getContentResolver()
 
@@ -854,7 +862,7 @@ class TubeSyncMobileApp(App):
         valores.put("_display_name", nombre_archivo)
         valores.put("mime_type", "audio/mpeg")
         valores.put("relative_path", RUTA_RELATIVA_PUBLICA)
-        valores.put("is_pending", 1)
+        valores.put("is_pending", Integer(1))
 
         uri_nuevo = resolver.insert(MediaStoreDownloads.EXTERNAL_CONTENT_URI, valores)
         if uri_nuevo is None:
@@ -872,7 +880,7 @@ class TubeSyncMobileApp(App):
             flujo_salida.close()
 
         valores_final = ContentValues()
-        valores_final.put("is_pending", 0)
+        valores_final.put("is_pending", Integer(0))
         resolver.update(uri_nuevo, valores_final, None, None)
 
     @staticmethod
