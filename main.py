@@ -61,6 +61,7 @@ except Exception:
     pass
 
 import queue
+import subprocess
 import sys
 import threading
 import traceback
@@ -808,7 +809,31 @@ class TubeSyncMobileApp(App):
 
     def _agregar_metadatos_y_caratula(self, archivo, info):
         """Paso 2 (a mejor esfuerzo): metadatos + caratula sobre el mp3 que
-        ya genero el paso 1."""
+        ya genero el paso 1.
+
+        La miniatura que entrega YouTube viene en formato WEBP. Para
+        incrustarla en el mp3, yt-dlp (EmbedThumbnail) la convierte antes
+        a un formato soportado -- y por defecto elige PNG ("PNG is
+        preferred since JPEG is lossy", logica interna de yt-dlp, no
+        configurable desde afuera). El problema: nuestro ffmpeg compilado
+        para Android NO tiene el codificador PNG (solo el contenedor
+        APNG, que es otra cosa) -- asi que esa conversion fallaba adentro
+        de EmbedThumbnail sin tirar un error que se note, y la caratula
+        quedaba afuera (el resto -- audio, metadatos -- funcionaba bien,
+        por eso Edgar via el tema bajar OK pero sin portada).
+
+        Se probo usar el postprocesador FFmpegThumbnailsConvertor de
+        yt-dlp para forzar la conversion a JPG antes de EmbedThumbnail,
+        pero esa clase depende de un diccionario interno
+        (info['__files_to_move']) que post_process() reinicia vacio en
+        este flujo de dos pasos -- tira KeyError. Por eso la conversion
+        webp->jpg se hace aca mismo, a mano, con una llamada directa a
+        ffmpeg (misma herramienta, mismo binario, sin pasar por esa
+        maquinaria interna), y se actualiza
+        info['thumbnails'][idx]['filepath'] para que EmbedThumbnail
+        encuentre el jpg ya convertido y nunca intente su propia
+        conversion a PNG."""
+        self._convertir_miniatura_a_jpg(info)
         opciones = {
             "quiet": True,
             "no_warnings": True,
@@ -820,6 +845,47 @@ class TubeSyncMobileApp(App):
         }
         with yt_dlp.YoutubeDL(opciones) as ydl:
             ydl.post_process(archivo, info)
+
+    @staticmethod
+    def _convertir_miniatura_a_jpg(info):
+        """Convierte a .jpg (con nuestro ffmpeg, via mjpeg) la miniatura
+        que haya quedado en disco, si hace falta -- ver el porque en el
+        docstring de _agregar_metadatos_y_caratula. Si ya es jpg/png, o
+        si no hay ninguna miniatura en disco, no hace nada (a mejor
+        esfuerzo: si la conversion falla, EmbedThumbnail simplemente no
+        va a poder incrustar caratula, pero el resto sigue andando)."""
+        miniaturas = info.get("thumbnails") or []
+        for miniatura in reversed(miniaturas):
+            ruta = miniatura.get("filepath")
+            if not ruta or not os.path.isfile(ruta):
+                continue
+            extension = os.path.splitext(ruta)[1].lower().lstrip(".")
+            if extension in ("jpg", "jpeg", "png"):
+                return
+            destino = os.path.splitext(ruta)[0] + ".jpg"
+            try:
+                resultado = subprocess.run(
+                    [
+                        ffmpeg_path() or "ffmpeg",
+                        "-y", "-loglevel", "error",
+                        "-i", ruta,
+                        "-update", "1", "-f", "image2", "-pattern_type", "none",
+                        destino,
+                    ],
+                    capture_output=True,
+                )
+            except Exception:
+                traceback.print_exc()
+                return
+            if resultado.returncode == 0 and os.path.isfile(destino):
+                miniatura["filepath"] = destino
+                try:
+                    os.remove(ruta)
+                except OSError:
+                    pass
+            else:
+                print(f"[miniatura] fallo la conversion a jpg: {resultado.stderr!r}")
+            return
 
     def _publicar_en_musica(self, ruta_archivo):
         """Mueve (no copia) el mp3 ya terminado a la carpeta PUBLICA de
