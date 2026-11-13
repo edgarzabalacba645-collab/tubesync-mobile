@@ -176,7 +176,6 @@ _NOMBRES_POSTPROCESO = {
     "FFmpegExtractAudio": "extrayendo audio (mp3)...",
     "Metadata": "agregando metadatos...",
     "FFmpegMetadata": "agregando metadatos...",
-    "EmbedThumbnail": "incrustando caratula...",
 }
 
 
@@ -711,12 +710,12 @@ class TubeSyncMobileApp(App):
     # Se hace en DOS pasos separados a proposito:
     #   1) Descargar + convertir a mp3 (FFmpegExtractAudio). Si esto anda,
     #      ya queda un archivo de audio usable pase lo que pase despues.
-    #   2) Agregar metadatos y caratula (FFmpegMetadata + EmbedThumbnail),
-    #      por separado y a "mejor esfuerzo": si este paso falla por lo que
-    #      sea, el mp3 del paso 1 NO se pierde ni se borra -- la fila queda
-    #      en "listo" igual, solo que sin caratula, en vez de mostrar un
-    #      error y no dejar ningun archivo (como pasaba antes, cuando los
-    #      3 postprocesos corrian como una sola operacion atomica).
+    #   2) Agregar metadatos (FFmpegMetadata) + incrustar caratula (a mano,
+    #      con ffmpeg directo -- ver _incrustar_caratula), por separado y a
+    #      "mejor esfuerzo": si este paso falla por lo que sea, el mp3 del
+    #      paso 1 NO se pierde ni se borra -- la fila queda en "listo"
+    #      igual (con un aviso), en vez de mostrar un error y no dejar
+    #      ningun archivo.
 
     def _worker(self):
         while True:
@@ -808,84 +807,149 @@ class TubeSyncMobileApp(App):
         }
 
     def _agregar_metadatos_y_caratula(self, archivo, info):
-        """Paso 2 (a mejor esfuerzo): metadatos + caratula sobre el mp3 que
-        ya genero el paso 1.
+        """Paso 2 (a mejor esfuerzo): metadatos (via yt-dlp) + caratula (a
+        mano, con ffmpeg directo -- ver _incrustar_caratula).
 
-        La miniatura que entrega YouTube viene en formato WEBP. Para
-        incrustarla en el mp3, yt-dlp (EmbedThumbnail) la convierte antes
-        a un formato soportado -- y por defecto elige PNG ("PNG is
-        preferred since JPEG is lossy", logica interna de yt-dlp, no
-        configurable desde afuera). El problema: nuestro ffmpeg compilado
-        para Android NO tiene el codificador PNG (solo el contenedor
-        APNG, que es otra cosa) -- asi que esa conversion fallaba adentro
-        de EmbedThumbnail sin tirar un error que se note, y la caratula
-        quedaba afuera (el resto -- audio, metadatos -- funcionaba bien,
-        por eso Edgar via el tema bajar OK pero sin portada).
+        Por que la caratula NO se hace via el postprocesador
+        EmbedThumbnail de yt-dlp (como se intento antes, build #19): esa
+        clase depende de que info['thumbnails'][idx]['filepath'] siga
+        apuntando, en esta MISMA instancia nueva de YoutubeDL, al archivo
+        que efectivamente escribio en disco la instancia ANTERIOR que
+        hizo la descarga -- una propagacion de estado entre dos objetos
+        yt-dlp distintos, via un dict interno (__files_to_move) que ni
+        siquiera es parte de la API publica de la libreria. Probarlo
+        requeriria un video real de YouTube, y este entorno no tiene
+        salida a internet para confirmarlo con certeza.
 
-        Se probo usar el postprocesador FFmpegThumbnailsConvertor de
-        yt-dlp para forzar la conversion a JPG antes de EmbedThumbnail,
-        pero esa clase depende de un diccionario interno
-        (info['__files_to_move']) que post_process() reinicia vacio en
-        este flujo de dos pasos -- tira KeyError. Por eso la conversion
-        webp->jpg se hace aca mismo, a mano, con una llamada directa a
-        ffmpeg (misma herramienta, mismo binario, sin pasar por esa
-        maquinaria interna), y se actualiza
-        info['thumbnails'][idx]['filepath'] para que EmbedThumbnail
-        encuentre el jpg ya convertido y nunca intente su propia
-        conversion a PNG."""
-        self._convertir_miniatura_a_jpg(info)
+        Por eso la caratula se maneja ENTERAMENTE aparte, sin depender
+        de nada de eso: _incrustar_caratula busca la miniatura
+        DIRECTAMENTE EN EL DISCO (incluso tiene que estar ahi, a este
+        punto el paso 1 ya la escribio -- writethumbnail=True) y la
+        incrusta con una llamada propia a ffmpeg. Lo unico de lo que
+        depende es de que el archivo este donde yt-dlp siempre lo deja
+        (al lado del mp3, mismo nombre base) -- eso si se puede
+        confirmar sin salir a internet, y se confirmo leyendo el codigo
+        fuente real de yt-dlp instalado en este entorno."""
         opciones = {
             "quiet": True,
             "no_warnings": True,
             "ffmpeg_location": ffmpeg_path(),
             "postprocessors": [
                 {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail"},
             ],
         }
         with yt_dlp.YoutubeDL(opciones) as ydl:
             ydl.post_process(archivo, info)
+        if not self._incrustar_caratula(archivo):
+            raise RuntimeError("no se encontro o no se pudo incrustar ninguna caratula")
 
     @staticmethod
-    def _convertir_miniatura_a_jpg(info):
-        """Convierte a .jpg (con nuestro ffmpeg, via mjpeg) la miniatura
-        que haya quedado en disco, si hace falta -- ver el porque en el
-        docstring de _agregar_metadatos_y_caratula. Si ya es jpg/png, o
-        si no hay ninguna miniatura en disco, no hace nada (a mejor
-        esfuerzo: si la conversion falla, EmbedThumbnail simplemente no
-        va a poder incrustar caratula, pero el resto sigue andando)."""
-        miniaturas = info.get("thumbnails") or []
-        for miniatura in reversed(miniaturas):
-            ruta = miniatura.get("filepath")
-            if not ruta or not os.path.isfile(ruta):
-                continue
-            extension = os.path.splitext(ruta)[1].lower().lstrip(".")
-            if extension in ("jpg", "jpeg", "png"):
-                return
-            destino = os.path.splitext(ruta)[0] + ".jpg"
+    def _tipo_imagen_real(ruta):
+        """Que tipo de imagen es un archivo, mirando sus primeros bytes --
+        NO su extension. Hace falta: YouTube a veces entrega una
+        miniatura con bytes webp detras de una extension que parece jpg
+        (bug conocido, el propio yt-dlp tiene un parche para esto mismo:
+        EmbedThumbnailPP.fixup_webp). Devuelve "jpg", "png", "webp" o
+        None (no reconocido / no se pudo leer)."""
+        try:
+            with open(ruta, "rb") as f:
+                cabecera = f.read(16)
+        except OSError:
+            return None
+        if cabecera.startswith(b"\xff\xd8\xff"):
+            return "jpg"
+        if cabecera.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if cabecera[:4] == b"RIFF" and cabecera[8:12] == b"WEBP":
+            return "webp"
+        return None
+
+    @classmethod
+    def _incrustar_caratula(cls, ruta_mp3):
+        """Busca en el disco, al lado del mp3 (mismo nombre base -- asi
+        la deja escrita yt-dlp con writethumbnail=True), la miniatura
+        del Paso 1 y la incrusta en el mp3 con una llamada directa a
+        ffmpeg -- el mismo comando que usa EmbedThumbnail de yt-dlp por
+        adentro, pero manejado aca a mano para no depender de su
+        bookkeeping interno (ver docstring de _agregar_metadatos_y_caratula).
+
+        Nuestro ffmpeg compilado para Android no tiene codificador PNG
+        (solo el contenedor APNG, que es otra cosa -- confirmado
+        revisando el binario con 'strings'), asi que si la miniatura no
+        es ya jpg/png DE VERDAD (ver _tipo_imagen_real), se convierte
+        primero a jpg (codificador mjpeg, ese si esta).
+
+        Devuelve True si quedo incrustada, False si no habia miniatura o
+        algo fallo (a mejor esfuerzo -- quien llama decide que hacer)."""
+        carpeta = os.path.dirname(ruta_mp3)
+        base = os.path.splitext(os.path.basename(ruta_mp3))[0]
+        miniatura = None
+        for extension in (".webp", ".jpg", ".jpeg", ".png"):
+            candidato = os.path.join(carpeta, base + extension)
+            if os.path.isfile(candidato):
+                miniatura = candidato
+                break
+        if miniatura is None:
+            print("[caratula] no se encontro ninguna miniatura en disco")
+            return False
+
+        if cls._tipo_imagen_real(miniatura) not in ("jpg", "png"):
+            convertida = os.path.join(carpeta, base + "_caratula.jpg")
             try:
                 resultado = subprocess.run(
                     [
                         ffmpeg_path() or "ffmpeg",
                         "-y", "-loglevel", "error",
-                        "-i", ruta,
+                        "-i", miniatura,
                         "-update", "1", "-f", "image2", "-pattern_type", "none",
-                        destino,
+                        convertida,
                     ],
                     capture_output=True,
                 )
             except Exception:
                 traceback.print_exc()
-                return
-            if resultado.returncode == 0 and os.path.isfile(destino):
-                miniatura["filepath"] = destino
-                try:
-                    os.remove(ruta)
-                except OSError:
-                    pass
-            else:
-                print(f"[miniatura] fallo la conversion a jpg: {resultado.stderr!r}")
-            return
+                return False
+            if resultado.returncode != 0 or not os.path.isfile(convertida):
+                print(f"[caratula] fallo la conversion a jpg: {resultado.stderr!r}")
+                return False
+            try:
+                os.remove(miniatura)
+            except OSError:
+                pass
+            miniatura = convertida
+
+        temporal = os.path.join(carpeta, base + "_con_caratula.mp3")
+        try:
+            resultado = subprocess.run(
+                [
+                    ffmpeg_path() or "ffmpeg",
+                    "-y", "-loglevel", "error",
+                    "-i", ruta_mp3, "-i", miniatura,
+                    "-map", "0:0", "-map", "1:0", "-c", "copy",
+                    "-write_id3v1", "1", "-id3v2_version", "3",
+                    "-metadata:s:v", "title=Album cover",
+                    "-metadata:s:v", "comment=Cover (front)",
+                    temporal,
+                ],
+                capture_output=True,
+            )
+        except Exception:
+            traceback.print_exc()
+            return False
+        if resultado.returncode == 0 and os.path.isfile(temporal):
+            os.replace(temporal, ruta_mp3)
+            try:
+                os.remove(miniatura)
+            except OSError:
+                pass
+            return True
+
+        print(f"[caratula] fallo al incrustar: {resultado.stderr!r}")
+        try:
+            os.remove(temporal)
+        except OSError:
+            pass
+        return False
 
     def _publicar_en_musica(self, ruta_archivo):
         """Mueve (no copia) el mp3 ya terminado a la carpeta PUBLICA de
