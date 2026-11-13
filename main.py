@@ -60,11 +60,15 @@ try:
 except Exception:
     pass
 
+import json
 import queue
+import re
 import subprocess
 import sys
 import threading
 import traceback
+import urllib.parse
+import urllib.request
 
 from kivy.app import App
 from kivy.clock import mainthread
@@ -176,6 +180,14 @@ _NOMBRES_POSTPROCESO = {
     "FFmpegExtractAudio": "extrayendo audio (mp3)...",
     "Metadata": "agregando metadatos...",
     "FFmpegMetadata": "agregando metadatos...",
+}
+
+# Un User-Agent de navegador normal para los pedidos HTTP a Spotify (ver
+# soporte de links de Spotify, mas abajo) -- sin esto, algunos sitios
+# (Spotify incluido) bloquean o le dan una respuesta distinta al User-Agent
+# por default de Python ("Python-urllib/3.x").
+_CABECERAS_HTTP = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 }
 
 
@@ -488,7 +500,7 @@ class TubeSyncMobileApp(App):
 
         tarjeta_input = Tarjeta(orientation="vertical", size_hint_y=None, height=dp(120), padding=dp(10), color=COLOR_TARJETA)
         self.input_links = TextInput(
-            hint_text="Pega uno o mas links de YouTube (uno por linea)",
+            hint_text="Pega uno o mas links de YouTube o Spotify (uno por linea)",
             background_normal="",
             background_active="",
             background_color=(0.16, 0.16, 0.2, 1),
@@ -721,11 +733,21 @@ class TubeSyncMobileApp(App):
         while True:
             link, fila = self.cola.get()
             try:
+                link_descarga, caratula_forzada = self._resolver_link(link, fila)
                 fila.set_estado("PREPARANDO", COLOR_INFO)
                 opciones = self._opciones_descarga(fila)
                 with yt_dlp.YoutubeDL(opciones) as ydl:
-                    info = ydl.extract_info(link, download=True)
+                    info = ydl.extract_info(link_descarga, download=True)
                     archivo = self._ruta_mp3_final(ydl, info)
+
+                if caratula_forzada:
+                    # Es un tema que vino de Spotify: la caratula real del
+                    # tema (la de Spotify) es mejor que la miniatura del
+                    # video de YouTube que matcheo la busqueda -- se
+                    # reemplaza ANTES de _agregar_metadatos_y_caratula,
+                    # que busca la miniatura en disco por nombre sin saber
+                    # ni importarle de donde salio.
+                    self._forzar_caratula(archivo, caratula_forzada)
 
                 try:
                     fila.set_estado("PROCESANDO", COLOR_INFO, detalle="agregando metadatos y caratula...")
@@ -788,6 +810,129 @@ class TubeSyncMobileApp(App):
             return candidato
 
         raise FileNotFoundError(f"no se encontro el mp3 convertido (se probo: {candidato!r})")
+
+    # --- Soporte para links de Spotify ----------------------------------
+    #
+    # Spotify protege el audio de sus temas (eso es lo que pide un ARL de
+    # cuenta de Deezer para saltear, algo que esta app NO hace -- ver
+    # conversacion). Lo que SI se puede hacer sin romper ninguna
+    # proteccion: leer el nombre del tema + artista + caratula de la
+    # pagina PUBLICA de Spotify (nadie necesita loguearse para ver esos
+    # datos, es la misma info que muestra cualquier preview de link), y
+    # con eso buscar y bajar el AUDIO desde YouTube -- exactamente el
+    # mismo motor que ya usa el resto de la app.
+
+    _PATRON_SPOTIFY = re.compile(r"spotify:track:([A-Za-z0-9]+)|open\.spotify\.com/(?:intl-\w+/)?track/([A-Za-z0-9]+)")
+
+    @classmethod
+    def _es_link_spotify(cls, link):
+        return cls._PATRON_SPOTIFY.search(link) is not None
+
+    def _resolver_link(self, link, fila):
+        """Si "link" es de Spotify, busca el tema + artista + caratula
+        (datos publicos, sin login) y devuelve en su lugar un link de
+        BUSQUEDA de YouTube ("ytsearch1:...") que yt-dlp entiende de
+        forma nativa -- asi el resto del codigo (descarga, conversion,
+        metadatos) no se entera de que esto empezo en Spotify, es
+        exactamente el mismo camino que un link de YouTube pegado a
+        mano. Si no es de Spotify, devuelve el link tal cual.
+
+        Devuelve (link_para_yt_dlp, url_caratula_o_None)."""
+        if not self._es_link_spotify(link):
+            return link, None
+
+        fila.set_estado("PREPARANDO", COLOR_INFO, detalle="leyendo el tema de Spotify...")
+        titulo, artista, caratula = self._metadata_spotify(link)
+        if not titulo:
+            raise RuntimeError("no se pudo leer el tema de Spotify (revisa el link)")
+
+        consulta = f"{artista} - {titulo}" if artista else titulo
+        fila.set_estado("PREPARANDO", COLOR_INFO, detalle=f'Spotify -> buscando "{consulta}" en YouTube...')
+        return f"ytsearch1:{consulta}", caratula
+
+    @staticmethod
+    def _metadata_spotify(link):
+        """Titulo, artista y caratula de un tema de Spotify, usando SOLO
+        paginas publicas (nada de login ni API key):
+
+        1) El oEmbed oficial de Spotify (documentado en
+           developer.spotify.com/documentation/embeds/reference/oembed),
+           que da "title" y "thumbnail_url" siempre.
+        2) La pagina normal del tema (tambien publica), de la que se
+           saca el ARTISTA por separado -- el <title> de esa pagina
+           sigue el patron "Tema - song by Artista | Spotify". Si este
+           paso falla (p.ej. Spotify cambia el formato de la pagina), no
+           es grave: se sigue con el titulo solo (sin artista), la
+           busqueda en YouTube es un poco menos precisa pero igual
+           funciona.
+
+        Devuelve (titulo, artista_o_None, url_caratula_o_None); titulo
+        es None si ni siquiera el oEmbed respondio."""
+        titulo, artista, caratula = None, None, None
+        try:
+            url_oembed = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(link, safe="")
+            peticion = urllib.request.Request(url_oembed, headers=_CABECERAS_HTTP)
+            with urllib.request.urlopen(peticion, timeout=15) as resp:
+                datos = json.loads(resp.read().decode("utf-8"))
+            titulo = datos.get("title") or None
+            caratula = datos.get("thumbnail_url") or None
+        except Exception:
+            traceback.print_exc()
+            return None, None, None
+
+        try:
+            peticion = urllib.request.Request(link, headers=_CABECERAS_HTTP)
+            with urllib.request.urlopen(peticion, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+            m = re.search(r"<title>(.*?)\s*-\s*song by\s*(.*?)\s*\|\s*Spotify</title>", html, re.IGNORECASE)
+            if m:
+                titulo, artista = m.group(1).strip(), m.group(2).strip()
+            if not caratula:
+                m2 = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+                if m2:
+                    caratula = m2.group(1)
+        except Exception:
+            traceback.print_exc()  # a mejor esfuerzo -- ya tenemos el titulo del oEmbed
+
+        return titulo, artista, caratula
+
+    @staticmethod
+    def _forzar_caratula(ruta_mp3, url_caratula):
+        """Descarga la caratula OFICIAL del tema de Spotify y la deja en
+        disco con el mismo nombre base que el mp3 -- asi
+        _incrustar_caratula (que busca por nombre, sin saber de donde
+        salio el audio) la encuentra a ELLA en vez de a la miniatura del
+        video de YouTube que matcheo la busqueda.
+
+        A PROPOSITO se descarga ANTES de borrar nada: si bajar la
+        caratula de Spotify falla (red, url rota, lo que sea), la
+        miniatura de YouTube que ya habia quedado escrita (de
+        writethumbnail=True) se deja intacta como respaldo, en vez de
+        quedar la descarga sin ninguna caratula por una falla que no
+        tiene nada que ver con YouTube."""
+        carpeta = os.path.dirname(ruta_mp3)
+        base = os.path.splitext(os.path.basename(ruta_mp3))[0]
+        destino = os.path.join(carpeta, base + ".jpg")
+        try:
+            peticion = urllib.request.Request(url_caratula, headers=_CABECERAS_HTTP)
+            with urllib.request.urlopen(peticion, timeout=15) as resp:
+                contenido = resp.read()
+        except Exception:
+            traceback.print_exc()  # a mejor esfuerzo -- se sigue con la miniatura
+            return                  # de YouTube que ya estaba en disco (si habia)
+
+        # Recien aca, con la caratula de Spotify ya en mano, se limpia
+        # cualquier miniatura vieja con el mismo nombre base para que
+        # _incrustar_caratula no encuentre dos candidatas.
+        for extension in (".webp", ".jpg", ".jpeg", ".png"):
+            viejo = os.path.join(carpeta, base + extension)
+            if os.path.isfile(viejo) and viejo != destino:
+                try:
+                    os.remove(viejo)
+                except OSError:
+                    pass
+        with open(destino, "wb") as f:
+            f.write(contenido)
 
     def _opciones_descarga(self, fila):
         """Paso 1: solo descargar y convertir a mp3."""
