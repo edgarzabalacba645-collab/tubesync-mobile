@@ -51,6 +51,23 @@ android.archs = arm64-v8a
 android.allow_backup = True
 android.accept_sdk_license = True
 
+# Compilamos en modo "release" (no "debug") para poder firmar con una clave
+# FIJA y explicita via las variables P4A_RELEASE_KEYSTORE/KEYALIAS/etc (ver
+# build-apk.yml). El modo "debug" tambien se puede firmar con una clave
+# fija en teoria (dejando un keystore fijo en ~/.android/debug.keystore),
+# pero se verifico con certeza que en este entorno de CI eso NO funciona:
+# se bajaron y revisaron los .apk de 4 builds reales (21 a 24) y cada uno
+# tenia un certificado de firma DISTINTO, generado justo en el momento de
+# cada build -- es decir, Gradle estaba ignorando el keystore fijo y
+# generando uno nuevo al azar cada vez (de ahi que SIEMPRE pidiera
+# desinstalar la version anterior). El modo "release" no tiene ese
+# problema porque la firma no depende de ninguna convencion implicita de
+# Gradle: se arma siempre con el mismo archivo exacto (ci/debug.keystore)
+# pasado por variable de entorno.
+# "apk" en vez del default "aab" -- un .aab no se puede instalar
+# directamente en el celular, hace falta Google Play o bundletool.
+android.release_artifact = apk
+
 [buildozer]
 log_level = 2
 warn_on_root = 1

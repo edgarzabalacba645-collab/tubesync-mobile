@@ -40,20 +40,42 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      # Cada corrida de GitHub Actions arranca en una maquina nueva: si no
-      # existe ~/.android/debug.keystore, Gradle genera uno AL AZAR para
-      # firmar el build debug. Eso significa que cada build quedaria firmado
-      # con una clave distinta, y Android se niega a instalar un APK encima
-      # de uno anterior si la firma no coincide ("conflicto con un
-      # paquete"). Usamos siempre el mismo keystore (committeado en el
-      # repo, ci/debug.keystore -- es un keystore de DEBUG, no secreto, con
-      # el alias/password estandar "androiddebugkey"/"android") para que
-      # todos los builds queden firmados igual y se puedan instalar unos
-      # sobre otros sin desinstalar antes.
-      - name: Instalar keystore de debug fijo
+      # HISTORIAL: antes esto copiaba ci/debug.keystore a
+      # ~/.android/debug.keystore, confiando en que Gradle usa ese archivo
+      # por default para firmar builds "debug". Edgar reporto que CADA
+      # build (del 20 al 24) le pedia desinstalar la version anterior antes
+      # de instalar la nueva -- es decir, esa firma fija nunca funciono.
+      #
+      # Se verifico la causa con certeza: se bajaron los .apk reales de los
+      # builds 21, 22, 23 y 24 desde GitHub Releases y se les inspecciono el
+      # certificado de firma (con androguard, que lee el "APK Signing
+      # Block" v2/v3 directamente). Resultado: los 4 builds tenian un
+      # certificado DISTINTO entre si, cada uno con fecha "valido desde"
+      # igual al momento exacto de ESE build -- prueba de que Gradle estaba
+      # generando un keystore nuevo al azar en cada corrida e IGNORANDO por
+      # completo el archivo fijo que copiabamos a ~/.android/debug.keystore
+      # (la convencion de Gradle para encontrar ese archivo por default
+      # depende de variables de entorno/ubicaciones que en este runner de
+      # GitHub Actions no se resuelven como uno esperaria -- no vale la
+      # pena perseguir exactamente cual, porque hay una forma de firmar que
+      # no depende de ninguna convencion implicita).
+      #
+      # LA SOLUCION: en vez de pelear con la firma implicita de "debug",
+      # compilamos en modo "release" (ver android.release_artifact en
+      # buildozer.spec) y la firmamos de forma EXPLICITA pasando el archivo
+      # exacto por variable de entorno (P4A_RELEASE_KEYSTORE y relacionadas
+      # -- esto se confirmo leyendo el .gradle que genera python-for-android:
+      # "storeFile file(System.getenv('P4A_RELEASE_KEYSTORE'))", sin
+      # ninguna ruta implicita de por medio). Seguimos usando el mismo
+      # keystore de siempre (ci/debug.keystore -- no es secreto, alias
+      # "androiddebugkey", password "android") para que todos los builds
+      # futuros queden firmados exactamente igual entre si.
+      - name: Configurar la firma fija (release) para que las instalaciones se actualicen sin desinstalar
         run: |
-          mkdir -p ~/.android
-          cp ci/debug.keystore ~/.android/debug.keystore
+          echo "P4A_RELEASE_KEYSTORE=$(pwd)/ci/debug.keystore" >> "$GITHUB_ENV"
+          echo "P4A_RELEASE_KEYALIAS=androiddebugkey" >> "$GITHUB_ENV"
+          echo "P4A_RELEASE_KEYSTORE_PASSWD=android" >> "$GITHUB_ENV"
+          echo "P4A_RELEASE_KEYALIAS_PASSWD=android" >> "$GITHUB_ENV"
 
       - name: Instalar dependencias del sistema
         run: |
@@ -257,7 +279,28 @@ jobs:
 
       - name: Compilar con Buildozer
         run: |
-          yes | buildozer -v android debug
+          yes | buildozer -v android release
+
+      # Chequeo automatico de que la firma quedo fija (para no depender de
+      # bajar el .apk a mano cada vez que se sospeche de este tema otra
+      # vez): compara el certificado del .apk recien armado contra el
+      # certificado real que contiene ci/debug.keystore. Si alguna vez
+      # vuelve a desalinearse, esto falla la build con un mensaje claro en
+      # vez de que Edgar lo descubra recien al instalar en el celular.
+      #
+      # Se usa Python + androguard (lee el certificado del "APK Signing
+      # Block" v2/v3 directamente) en vez de parsear la salida de texto de
+      # "apksigner", porque este metodo ya se probo con exito en builds
+      # reales (21 a 24) para diagnosticar este mismo problema -- parsear
+      # el formato de texto de otra herramienta sin poder probarlo antes
+      # hubiera sido justamente el tipo de "prueba a ver si funciona" que
+      # hay que evitar.
+      - name: Verificar que el .apk quedo firmado con la clave fija
+        run: |
+          set -e
+          pip3 install --quiet androguard cryptography
+          APK="$(ls bin/*.apk | head -1)"
+          python3 ci/verificar_firma.py "$APK" ci/debug.keystore
 
       - name: Subir el .apk como artifact (para ver logs/debug rapido)
         uses: actions/upload-artifact@v4
