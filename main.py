@@ -60,6 +60,7 @@ try:
 except Exception:
     pass
 
+import difflib
 import json
 import queue
 import re
@@ -68,6 +69,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -885,12 +887,12 @@ class TubeSyncMobileApp(App):
 
     def _resolver_link(self, link, fila):
         """Si "link" es de Spotify, busca el tema + artista + caratula
-        (datos publicos, sin login) y devuelve en su lugar un link de
-        BUSQUEDA de YouTube ("ytsearch1:...") que yt-dlp entiende de
-        forma nativa -- asi el resto del codigo (descarga, conversion,
-        metadatos) no se entera de que esto empezo en Spotify, es
-        exactamente el mismo camino que un link de YouTube pegado a
-        mano. Si no es de Spotify, devuelve el link tal cual.
+        (datos publicos, sin login) y devuelve en su lugar el link
+        DIRECTO del video de YouTube que mejor matchea -- asi el resto
+        del codigo (descarga, conversion, metadatos) no se entera de
+        que esto empezo en Spotify, es exactamente el mismo camino que
+        un link de YouTube pegado a mano. Si no es de Spotify, devuelve
+        el link tal cual.
 
         Devuelve (link_para_yt_dlp, url_caratula_o_None)."""
         if not self._es_link_spotify(link):
@@ -904,7 +906,89 @@ class TubeSyncMobileApp(App):
 
         consulta = f"{artista} - {titulo}" if artista else titulo
         fila.set_estado("PREPARANDO", COLOR_INFO, detalle=f'Spotify -> buscando "{consulta}" en YouTube...')
-        return f"ytsearch1:{consulta}", caratula
+        url_youtube = self._mejor_resultado_youtube(consulta, artista, titulo)
+        return url_youtube, caratula
+
+    _CANTIDAD_RESULTADOS_BUSQUEDA = 5
+
+    @classmethod
+    def _mejor_resultado_youtube(cls, consulta, artista, titulo):
+        """El primer resultado de una busqueda de YouTube NO siempre es
+        el tema correcto -- un cover de otro interprete, una version en
+        vivo, un remix o un video con titulo parecido pueden rankear
+        mas arriba que el audio real del tema buscado (esto le paso a
+        Edgar: busco un tema y bajo uno de otro interprete, con la
+        caratula de Spotify del tema que SI habia elegido puesta
+        encima). Por eso ac se piden varios candidatos y se elige el
+        que mejor matchea el interprete + tema (+ version, si el
+        titulo de Spotify la incluye -- va adentro de "titulo" tal
+        cual vino, remix/live/etc. incluido) -- en vez de confiar en el
+        orden de YouTube.
+
+        Solo se piden METADATOS de los candidatos (download=False); el
+        audio se descarga una sola vez, recien despues, del elegido --
+        confirmado leyendo YoutubeDL.process_ie_result (el flag
+        download se pasa intacto a cada entrada resuelta) que esto no
+        descarga nada de mas.
+
+        Devuelve la URL del video elegido (link normal de YouTube,
+        igual a uno pegado a mano)."""
+        opciones = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(opciones) as ydl:
+            info = ydl.extract_info(
+                f"ytsearch{cls._CANTIDAD_RESULTADOS_BUSQUEDA}:{consulta}", download=False)
+
+        candidatos = list((info or {}).get("entries") or [])
+        if not candidatos:
+            raise RuntimeError(f'no se encontro nada en YouTube para "{consulta}"')
+
+        mejor = max(candidatos, key=lambda c: cls._puntaje_resultado(artista, titulo, c))
+        return (mejor.get("webpage_url") or mejor.get("url")
+                or f"https://www.youtube.com/watch?v={mejor.get('id')}")
+
+    @staticmethod
+    def _normalizar_texto(texto):
+        """minusculas, sin acentos, sin signos -- para comparar titulos
+        sin que un acento de mas/de menos cambie el resultado."""
+        texto = (texto or "").lower()
+        texto = unicodedata.normalize("NFKD", texto)
+        texto = "".join(c for c in texto if not unicodedata.combining(c))
+        texto = re.sub(r"[^a-z0-9 ]", " ", texto)
+        return re.sub(r"\s+", " ", texto).strip()
+
+    @classmethod
+    def _puntaje_resultado(cls, artista, titulo, entrada):
+        """Que tan bien matchea un resultado de YouTube con el
+        interprete + tema reales de Spotify. Combina similitud de
+        texto completa (titulo del video contra "interprete - tema",
+        asi que una version/remix/live que Spotify incluya en el
+        titulo tambien suma o resta similitud) con un plus fuerte si
+        el CANAL del video es el del interprete -- asi es como YouTube
+        identifica los uploads oficiales de un artista (canales
+        "Interprete - Topic" generados para su discografia, o su canal
+        verificado), la señal mas confiable de que es el tema correcto
+        y no un cover/version de otro interprete con titulo parecido."""
+        consulta_norm = cls._normalizar_texto(f"{artista} - {titulo}" if artista else titulo)
+        titulo_video_norm = cls._normalizar_texto(entrada.get("title"))
+        canal_norm = cls._normalizar_texto(entrada.get("channel") or entrada.get("uploader") or "")
+
+        puntaje = difflib.SequenceMatcher(None, consulta_norm, titulo_video_norm).ratio()
+
+        artista_norm = cls._normalizar_texto(artista) if artista else ""
+        if artista_norm and artista_norm in canal_norm:
+            puntaje += 0.35
+        elif artista_norm and artista_norm in titulo_video_norm:
+            puntaje += 0.15
+
+        titulo_norm = cls._normalizar_texto(titulo)
+        if titulo_norm and titulo_norm in titulo_video_norm:
+            puntaje += 0.15
+
+        return puntaje
 
     @staticmethod
     def _metadata_spotify(link):
