@@ -61,6 +61,7 @@ except Exception:
     pass
 
 import difflib
+import html
 import json
 import queue
 import re
@@ -1515,8 +1516,31 @@ class TubeSyncMobileApp(App):
         if not titulo:
             detalle = f": {error}" if error else ""
             raise RuntimeError(f"no se pudo leer el tema de Spotify (revisa el link){detalle}")
+        if not artista:
+            # Sin artista la busqueda en YouTube queda SOLO con el
+            # titulo (p.ej. "No Me Lastimes") -- un texto generico que
+            # puede matchear con un tema de OTRO interprete totalmente
+            # distinto (esto le paso a Edgar con este mismo tema: el
+            # <title> de la pagina de Spotify venia como "... - song
+            # AND LYRICS by Marcela Morelo, La Delio Valdez, Soledad,
+            # Luis Burgio | Spotify" -- el regex viejo solo reconocia
+            # "song by" exacto, no matcheaba esa variante, y se perdia
+            # el artista EN SILENCIO; con la busqueda reducida a solo
+            # "No Me Lastimes" la app bajo el tema de otro interprete
+            # con el mismo nombre). _metadata_spotify ya prueba dos
+            # caminos distintos para conseguir el artista (el meta tag
+            # "music:musician_description" y el <title>, ahora
+            # tolerante a "song and lyrics by" tambien); si NINGUNO de
+            # los dos lo consigue, es mas seguro frenar aca con un
+            # error visible que arriesgar bajar el tema equivocado sin
+            # que se note.
+            raise RuntimeError(
+                "no se pudo identificar el artista del tema de Spotify (solo "
+                "se consiguio el titulo) -- para no arriesgar bajar el tema "
+                "equivocado, no se busca en YouTube sin esa informacion"
+            )
 
-        consulta = f"{artista} - {titulo}" if artista else titulo
+        consulta = f"{artista} - {titulo}"
         fila.set_estado("PREPARANDO", COLOR_INFO, detalle=f'Spotify -> buscando "{consulta}" en YouTube...')
         url_youtube = self._mejor_resultado_youtube(consulta, artista, titulo)
         return url_youtube, caratula
@@ -1572,6 +1596,24 @@ class TubeSyncMobileApp(App):
         texto = re.sub(r"[^a-z0-9 ]", " ", texto)
         return re.sub(r"\s+", " ", texto).strip()
 
+    _SEPARADOR_ARTISTAS = re.compile(r",|&|\bfeat\.?\b|\bft\.?\b|\by\b|\band\b", re.IGNORECASE)
+
+    @classmethod
+    def _lista_artistas(cls, artista):
+        """Spotify casi siempre da el/los artista(s) de un tema como UN
+        solo texto con varios nombres juntos (p.ej. "Marcela Morelo, La
+        Delio Valdez, Soledad, Luis Burgio" para un tema con invitados).
+        Comparar ese texto COMPLETO contra el canal/titulo de un video
+        de YouTube casi nunca matchea (ni el canal ni el titulo suelen
+        traer los 4 nombres juntos, en ese orden exacto) -- por eso se
+        separa en artistas individuales (coma, "&", "feat"/"ft", " y
+        "/" and ") y alcanza con que UNO solo aparezca para dar la
+        señal de que es el interprete correcto."""
+        if not artista:
+            return []
+        partes = cls._SEPARADOR_ARTISTAS.split(artista)
+        return [n for n in (cls._normalizar_texto(p) for p in partes) if n]
+
     @classmethod
     def _puntaje_resultado(cls, artista, titulo, entrada):
         """Que tan bien matchea un resultado de YouTube con el
@@ -1579,21 +1621,25 @@ class TubeSyncMobileApp(App):
         texto completa (titulo del video contra "interprete - tema",
         asi que una version/remix/live que Spotify incluya en el
         titulo tambien suma o resta similitud) con un plus fuerte si
-        el CANAL del video es el del interprete -- asi es como YouTube
-        identifica los uploads oficiales de un artista (canales
-        "Interprete - Topic" generados para su discografia, o su canal
-        verificado), la señal mas confiable de que es el tema correcto
-        y no un cover/version de otro interprete con titulo parecido."""
+        el CANAL del video es el de alguno de los interpretes -- asi es
+        como YouTube identifica los uploads oficiales de un artista
+        (canales "Interprete - Topic" generados para su discografia, o
+        su canal verificado), la señal mas confiable de que es el tema
+        correcto y no un cover/version de otro interprete con titulo
+        parecido. Se compara interprete por interprete (ver
+        _lista_artistas), no el texto completo de todos juntos, porque
+        un tema con artistas invitados casi nunca aparece con todos
+        los nombres juntos en el canal o titulo del video."""
         consulta_norm = cls._normalizar_texto(f"{artista} - {titulo}" if artista else titulo)
         titulo_video_norm = cls._normalizar_texto(entrada.get("title"))
         canal_norm = cls._normalizar_texto(entrada.get("channel") or entrada.get("uploader") or "")
 
         puntaje = difflib.SequenceMatcher(None, consulta_norm, titulo_video_norm).ratio()
 
-        artista_norm = cls._normalizar_texto(artista) if artista else ""
-        if artista_norm and artista_norm in canal_norm:
+        artistas_norm = cls._lista_artistas(artista)
+        if artistas_norm and any(a in canal_norm for a in artistas_norm):
             puntaje += 0.35
-        elif artista_norm and artista_norm in titulo_video_norm:
+        elif artistas_norm and any(a in titulo_video_norm for a in artistas_norm):
             puntaje += 0.15
 
         titulo_norm = cls._normalizar_texto(titulo)
@@ -1610,13 +1656,31 @@ class TubeSyncMobileApp(App):
         1) El oEmbed oficial de Spotify (documentado en
            developer.spotify.com/documentation/embeds/reference/oembed),
            que da "title" y "thumbnail_url" siempre.
-        2) La pagina normal del tema (tambien publica), de la que se
-           saca el ARTISTA por separado -- el <title> de esa pagina
-           sigue el patron "Tema - song by Artista | Spotify". Si este
-           paso falla (p.ej. Spotify cambia el formato de la pagina), no
-           es grave: se sigue con el titulo solo (sin artista), la
-           busqueda en YouTube es un poco menos precisa pero igual
-           funciona.
+        2) La pagina normal del tema (tambien publica). De ahi se saca
+           el ARTISTA por DOS caminos, en orden de confianza:
+           a) el meta tag "music:musician_description" -- un campo
+              propio de Spotify pensado exactamente para esto (la
+              lista de artistas del tema), sin depender de ninguna
+              frase en texto que Spotify pueda cambiar.
+           b) si ese meta tag no esta, el <title> de la pagina, que
+              sigue el patron "Tema - song by Artista | Spotify" --
+              PERO Spotify tambien usa "song AND LYRICS by Artista"
+              para temas que tienen letra disponible (confirmado con
+              un tema real de Edgar: el <title> real fue "No Me
+              Lastimes - song and lyrics by Marcela Morelo, La Delio
+              Valdez, Soledad, Luis Burgio | Spotify" -- el regex
+              viejo, que solo reconocia "song by" exacto, no matcheaba
+              esto y se quedaba sin artista EN SILENCIO). Por eso este
+              regex ahora acepta cualquier texto entre "song" y "by",
+              no solo "song by" pegados.
+
+           Si NINGUNO de los dos caminos encuentra artista, el llamador
+           (_resolver_link) frena con un error en vez de seguir solo
+           con el titulo: un titulo solo (p.ej. "No Me Lastimes") es
+           un texto generico que puede matchear con un tema de OTRO
+           interprete completamente distinto en YouTube -- exactamente
+           lo que le paso a Edgar con este mismo tema cuando el regex
+           viejo fallaba en silencio.
 
         Devuelve (titulo, artista_o_None, url_caratula_o_None,
         error_o_None); titulo es None si ni siquiera el oEmbed respondio
@@ -1637,12 +1701,24 @@ class TubeSyncMobileApp(App):
         try:
             peticion = urllib.request.Request(link, headers=_CABECERAS_HTTP)
             with urllib.request.urlopen(peticion, timeout=15, context=_CONTEXTO_SSL) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-            m = re.search(r"<title>(.*?)\s*-\s*song by\s*(.*?)\s*\|\s*Spotify</title>", html, re.IGNORECASE)
-            if m:
-                titulo, artista = m.group(1).strip(), m.group(2).strip()
+                html_pagina = resp.read().decode("utf-8", errors="replace")
+
+            m_artista = re.search(
+                r'<meta property="music:musician_description" content="([^"]+)"',
+                html_pagina)
+            if m_artista:
+                artista = html.unescape(m_artista.group(1)).strip() or None
+
+            m_titulo = re.search(
+                r"<title>(.*?)\s*-\s*song\b.*?\bby\s*(.*?)\s*\|\s*Spotify</title>",
+                html_pagina, re.IGNORECASE)
+            if m_titulo:
+                titulo = html.unescape(m_titulo.group(1)).strip() or titulo
+                if not artista:
+                    artista = html.unescape(m_titulo.group(2)).strip() or None
+
             if not caratula:
-                m2 = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+                m2 = re.search(r'<meta property="og:image" content="([^"]+)"', html_pagina)
                 if m2:
                     caratula = m2.group(1)
         except Exception:
