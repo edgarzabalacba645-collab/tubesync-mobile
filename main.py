@@ -194,6 +194,20 @@ _CABECERAS_HTTP = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 }
 
+# Cuanto de la pagina de un tema de Spotify se lee como maximo
+# (_metadata_spotify) para buscar el <title>/meta tags del <head> -- NO
+# hace falta la pagina entera, que puede pesar mas de 300KB sin comprimir
+# (confirmado con un tema real: 348436 caracteres, con el </head> recien
+# en el caracter 26659). Cortar la lectura bastante antes de esos ~350KB
+# hace el pedido mas rapido y con menos chance de cortarse a mitad de
+# camino en una red movil lenta/inestable -- que es la sospecha mas
+# probable de por que a veces este pedido no trae el artista en el
+# telefono real de Edgar aunque el regex en si ya se confirmo que
+# funciona bien contra el HTML real (ver _metadata_spotify). 120.000
+# caracteres da margen de sobra (~4.5x el <head> real visto) sin acercarse
+# al tamano completo de la pagina.
+_MAX_BYTES_PAGINA_SPOTIFY = 120_000
+
 # Contexto SSL para los pedidos HTTPS propios (Spotify) -- las variables de
 # entorno SSL_CERT_FILE / REQUESTS_CA_BUNDLE de mas arriba (antes de
 # "import yt_dlp") le alcanzan a yt-dlp porque yt-dlp arma su PROPIO
@@ -1520,24 +1534,22 @@ class TubeSyncMobileApp(App):
             # Sin artista la busqueda en YouTube queda SOLO con el
             # titulo (p.ej. "No Me Lastimes") -- un texto generico que
             # puede matchear con un tema de OTRO interprete totalmente
-            # distinto (esto le paso a Edgar con este mismo tema: el
-            # <title> de la pagina de Spotify venia como "... - song
-            # AND LYRICS by Marcela Morelo, La Delio Valdez, Soledad,
-            # Luis Burgio | Spotify" -- el regex viejo solo reconocia
-            # "song by" exacto, no matcheaba esa variante, y se perdia
-            # el artista EN SILENCIO; con la busqueda reducida a solo
-            # "No Me Lastimes" la app bajo el tema de otro interprete
-            # con el mismo nombre). _metadata_spotify ya prueba dos
-            # caminos distintos para conseguir el artista (el meta tag
-            # "music:musician_description" y el <title>, ahora
-            # tolerante a "song and lyrics by" tambien); si NINGUNO de
-            # los dos lo consigue, es mas seguro frenar aca con un
-            # error visible que arriesgar bajar el tema equivocado sin
-            # que se note.
+            # distinto. _metadata_spotify ya prueba dos caminos para
+            # conseguir el artista (el meta tag
+            # "music:musician_description" y el <title>, tolerante a
+            # "song and lyrics by" tambien); si NINGUNO de los dos lo
+            # consigue -- tipicamente porque ni siquiera se pudo leer
+            # la pagina completa de Spotify (timeout, corte de red,
+            # etc. -- ese segundo pedido trae una pagina bastante
+            # pesada) -- es mas seguro frenar aca con un error visible
+            # (y con el motivo real, si se pudo determinar) que
+            # arriesgar bajar el tema equivocado sin que se note.
+            detalle = f": {error}" if error else ""
             raise RuntimeError(
-                "no se pudo identificar el artista del tema de Spotify (solo "
-                "se consiguio el titulo) -- para no arriesgar bajar el tema "
-                "equivocado, no se busca en YouTube sin esa informacion"
+                "no se pudo identificar el artista del tema de Spotify "
+                f"(solo se consiguio el titulo){detalle} -- para no arriesgar "
+                "bajar el tema equivocado, no se busca en YouTube sin esa "
+                "informacion. Probá de nuevo (puede haber sido un corte de red)."
             )
 
         consulta = f"{artista} - {titulo}"
@@ -1661,7 +1673,15 @@ class TubeSyncMobileApp(App):
            a) el meta tag "music:musician_description" -- un campo
               propio de Spotify pensado exactamente para esto (la
               lista de artistas del tema), sin depender de ninguna
-              frase en texto que Spotify pueda cambiar.
+              frase en texto que Spotify pueda cambiar. OJO: en el
+              HTML real este tag usa el atributo "name=", NO
+              "property=" (a diferencia de los og:* de al lado, que SI
+              usan "property=") -- confirmado trayendo el HTML real de
+              un link de Edgar vía CI: un primer intento que asumia
+              "property=" para TODOS los meta tags nunca matcheaba
+              este, aunque el texto "music:musician_description" SI
+              estaba presente en la pagina. Por eso el regex ahora
+              acepta "name=" o "property=" indistintamente.
            b) si ese meta tag no esta, el <title> de la pagina, que
               sigue el patron "Tema - song by Artista | Spotify" --
               PERO Spotify tambien usa "song AND LYRICS by Artista"
@@ -1674,18 +1694,40 @@ class TubeSyncMobileApp(App):
               regex ahora acepta cualquier texto entre "song" y "by",
               no solo "song by" pegados.
 
-           Si NINGUNO de los dos caminos encuentra artista, el llamador
-           (_resolver_link) frena con un error en vez de seguir solo
-           con el titulo: un titulo solo (p.ej. "No Me Lastimes") es
-           un texto generico que puede matchear con un tema de OTRO
-           interprete completamente distinto en YouTube -- exactamente
-           lo que le paso a Edgar con este mismo tema cuando el regex
-           viejo fallaba en silencio.
+           Ambos caminos ya se confirmaron funcionando contra el HTML
+           REAL de Spotify para el tema de Edgar (via un diagnostico
+           puntual corrido en CI, con salida real a internet) -- asi
+           que si en algun momento NINGUNO de los dos consigue
+           artista, lo mas probable no es que el regex este mal, sino
+           que este segundo pedido (la pagina completa, bastante mas
+           pesada que el oEmbed -- se vio que puede pesar mas de
+           300KB sin comprimir) no se pudo completar del todo en una
+           red mobil mas lenta/inestable antes del timeout. Por eso
+           ahora: se lee como maximo _MAX_BYTES_PAGINA_SPOTIFY (de
+           sobra para el <head>, que es lo unico que hace falta, pero
+           muchisimo menos que la pagina entera -- mas rapido y con
+           menos chance de cortarse a mitad de camino), con mas
+           tiempo de timeout que el oEmbed (que es un JSON chiquito),
+           y si aun asi este segundo pedido falla, el motivo real
+           (timeout, corte de conexion, lo que sea) se devuelve en
+           vez de tragárselo en silencio -- asi el llamador
+           (_resolver_link) puede mostrarlo en la fila en vez de un
+           mensaje generico sin pistas.
+
+        Si NINGUNO de los dos caminos encuentra artista, el llamador
+        (_resolver_link) frena con un error en vez de seguir solo con
+        el titulo: un titulo solo (p.ej. "No Me Lastimes") es un
+        texto generico que puede matchear con un tema de OTRO
+        interprete completamente distinto en YouTube -- exactamente
+        lo que le paso a Edgar con este mismo tema.
 
         Devuelve (titulo, artista_o_None, url_caratula_o_None,
         error_o_None); titulo es None si ni siquiera el oEmbed respondio
-        (en ese caso error trae el detalle real de por que, para poder
-        mostrarlo en vez de un mensaje generico)."""
+        (en ese caso error trae el detalle real de por que). Si el
+        oEmbed SI respondio pero el segundo pedido (el de la pagina
+        completa, el que trae el artista) fallo, titulo va a venir
+        igual (solo con el titulo, sin artista) pero error tambien va
+        a traer el motivo real de esa falla, para poder mostrarlo."""
         titulo, artista, caratula = None, None, None
         try:
             url_oembed = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(link, safe="")
@@ -1698,13 +1740,14 @@ class TubeSyncMobileApp(App):
             traceback.print_exc()
             return None, None, None, f"{type(e).__name__}: {e}"
 
+        error_pagina = None
         try:
             peticion = urllib.request.Request(link, headers=_CABECERAS_HTTP)
-            with urllib.request.urlopen(peticion, timeout=15, context=_CONTEXTO_SSL) as resp:
-                html_pagina = resp.read().decode("utf-8", errors="replace")
+            with urllib.request.urlopen(peticion, timeout=25, context=_CONTEXTO_SSL) as resp:
+                html_pagina = resp.read(_MAX_BYTES_PAGINA_SPOTIFY).decode("utf-8", errors="replace")
 
             m_artista = re.search(
-                r'<meta property="music:musician_description" content="([^"]+)"',
+                r'<meta (?:name|property)="music:musician_description" content="([^"]+)"',
                 html_pagina)
             if m_artista:
                 artista = html.unescape(m_artista.group(1)).strip() or None
@@ -1718,13 +1761,14 @@ class TubeSyncMobileApp(App):
                     artista = html.unescape(m_titulo.group(2)).strip() or None
 
             if not caratula:
-                m2 = re.search(r'<meta property="og:image" content="([^"]+)"', html_pagina)
+                m2 = re.search(r'<meta (?:name|property)="og:image" content="([^"]+)"', html_pagina)
                 if m2:
                     caratula = m2.group(1)
-        except Exception:
+        except Exception as e:
             traceback.print_exc()  # a mejor esfuerzo -- ya tenemos el titulo del oEmbed
+            error_pagina = f"{type(e).__name__}: {e}"
 
-        return titulo, artista, caratula, None
+        return titulo, artista, caratula, error_pagina
 
     @staticmethod
     def _forzar_caratula(ruta_mp3, url_caratula):

@@ -22,7 +22,7 @@ REGEX_TITULO_NUEVO = re.compile(
 REGEX_TITULO_VIEJO = re.compile(
     r"<title>(.*?)\s*-\s*song by\s*(.*?)\s*\|\s*Spotify</title>", re.IGNORECASE)
 REGEX_MUSICIAN_DESC = re.compile(
-    r'<meta property="music:musician_description" content="([^"]+)"')
+    r'<meta (?:name|property)="music:musician_description" content="([^"]+)"')
 REGEX_OG_IMAGE = re.compile(r'<meta property="og:image" content="([^"]+)"')
 REGEX_TITLE_TAG_CRUDO = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -59,8 +59,16 @@ def main(link):
     print()
 
     m_musico = REGEX_MUSICIAN_DESC.search(html_pagina)
-    print("=== meta music:musician_description ===")
+    print("=== meta music:musician_description (name= o property=) ===")
     print(repr(html.unescape(m_musico.group(1))) if m_musico else "(no esta presente en el HTML)")
+    print()
+
+    html_recortado = html_pagina[:120_000]
+    m_nuevo_recortado = REGEX_TITULO_NUEVO.search(html_recortado)
+    m_musico_recortado = REGEX_MUSICIAN_DESC.search(html_recortado)
+    print("=== Con el HTML CORTADO a 120.000 caracteres (lo que va a leer la app) ===")
+    print(f"titulo/artista via <title>: {'OK' if m_nuevo_recortado else 'NO matcheo'}")
+    print(f"artista via music:musician_description: {'OK' if m_musico_recortado else 'NO matcheo'}")
     print()
 
     m_img = REGEX_OG_IMAGE.search(html_pagina)
