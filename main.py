@@ -1509,8 +1509,21 @@ class TubeSyncMobileApp(App):
     _PATRON_SPOTIFY = re.compile(r"spotify:track:([A-Za-z0-9]+)|open\.spotify\.com/(?:intl-\w+/)?track/([A-Za-z0-9]+)")
 
     @classmethod
+    def _id_track_spotify(cls, link):
+        """El ID del tema (lo que viene despues de "track:" o "track/"),
+        sin importar que otra cosa traiga el link -- un link copiado
+        desde la app de Spotify con "Compartir -> Copiar link" trae
+        ADEMAS parametros de tracking (?si=..., utm_source=copy-link,
+        context=..., dlsi=..., etc.) que no hacen falta para nada (ver
+        _resolver_link, que arma un link LIMPIO con solo este ID antes
+        de pedirle nada a Spotify). Devuelve None si no es un link de
+        Spotify."""
+        m = cls._PATRON_SPOTIFY.search(link)
+        return (m.group(1) or m.group(2)) if m else None
+
+    @classmethod
     def _es_link_spotify(cls, link):
-        return cls._PATRON_SPOTIFY.search(link) is not None
+        return cls._id_track_spotify(link) is not None
 
     def _resolver_link(self, link, fila):
         """Si "link" es de Spotify, busca el tema + artista + caratula
@@ -1525,8 +1538,29 @@ class TubeSyncMobileApp(App):
         if not self._es_link_spotify(link):
             return link, None
 
+        # Un link COPIADO DESDE LA APP de Spotify (el boton "Compartir
+        # -> Copiar link", que es como Edgar comparte sus temas) no es
+        # solo "open.spotify.com/track/ID": trae ademas parametros de
+        # tracking (si=, utm_source=copy-link, context=, dlsi=, etc.).
+        # Confirmado con el link real de Edgar (reproducido en CI, con
+        # salida real a internet): CON esos parametros, el servidor de
+        # Spotify responde un HTTP 307 que redirige a una URL
+        # "intent://open?...package=com.spotify.music..." -- un intent
+        # de Android para abrir la app nativa de Spotify, con un bloque
+        # enorme de datos de tracking codificados adentro (el texto
+        # "_branch_match_id=...&_branch_referrer=H4sI..." que aparecio
+        # en el error que vio Edgar es un pedazo literal de esa URL).
+        # urllib (con razon) se niega a seguir un redirect a un
+        # esquema que no es http/https, y tira ese HTTPError. SIN esos
+        # parametros (solo "open.spotify.com/track/ID"), Spotify
+        # responde la pagina normal, derecho, sin ningun redirect --
+        # confirmado tambien en CI. Por eso se arma un link LIMPIO acá,
+        # con nada mas que el ID del tema, antes de pedirle nada a
+        # Spotify -- ni falta ni sirve para nada el tracking.
+        link_limpio = f"https://open.spotify.com/track/{self._id_track_spotify(link)}"
+
         fila.set_estado("PREPARANDO", COLOR_INFO, detalle="leyendo el tema de Spotify...")
-        titulo, artista, caratula, error = self._metadata_spotify(link)
+        titulo, artista, caratula, error = self._metadata_spotify(link_limpio)
         if not titulo:
             detalle = f": {error}" if error else ""
             raise RuntimeError(f"no se pudo leer el tema de Spotify (revisa el link){detalle}")
