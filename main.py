@@ -69,6 +69,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import unicodedata
 import urllib.parse
@@ -1380,17 +1381,69 @@ class TubeSyncMobileApp(App):
     #      igual (con un aviso), en vez de mostrar un error y no dejar
     #      ningun archivo.
 
+    # Edgar vio dos veces seguidas (con el mismo link) un error de
+    # conexion al servidor de video de YouTube (un host "*.googlevideo.
+    # com", que es donde YouTube sirve el audio/video real -- un pedido
+    # DISTINTO del de buscar/resolver el tema). Reintentando el mismo
+    # link A MANO una tercera vez le funciono. Esto encaja con como
+    # arma YouTube esos links: cada vez que se resuelve el video
+    # (extract_info) se asigna un servidor de CDN puntual para esa
+    # descarga -- si ESE servidor en particular no responde, yt-dlp ya
+    # reintenta solo la descarga (su default es 10 veces) PERO siempre
+    # contra la MISMA URL/servidor ya asignado, asi que si el problema
+    # es justamente ESE servidor, los 10 reintentos internos fallan
+    # todos igual. Un reintento COMPLETO (repetir _resolver_link +
+    # extract_info desde cero) le pide a YouTube una URL nueva, que
+    # puede caer en un servidor distinto -- exactamente lo que
+    # reintentar a mano termino logrando. Por eso ahora la app reintenta
+    # sola unas pocas veces, pero SOLO cuando el error tiene pinta de
+    # ser de conexion/red (ver _parece_error_de_conexion) -- un tema
+    # privado/borrado/sin audio no se arregla reintentando, asi que esos
+    # errores siguen mostrandose de una.
+    _REINTENTOS_DESCARGA = 3
+    _ESPERA_ENTRE_REINTENTOS_SEG = 3
+
+    _PATRON_ERROR_DE_CONEXION = re.compile(
+        r"failed to establish a new connection|connection refused"
+        r"|connection reset|connection aborted|remote end closed connection"
+        r"|max retries exceeded|timed? ?out|temporary failure in name resolution"
+        r"|network is unreachable|name or service not known|getaddrinfo failed"
+        r"|ssl.*(?:eof|handshake)|\[errno -?\d+\]",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _parece_error_de_conexion(cls, e):
+        """True si el TEXTO del error tiene toda la pinta de haber sido
+        un problema de red/conexion momentaneo (no se pudo conectar, se
+        corto la conexion, se agoto el tiempo) en vez de un problema
+        real con el tema en si (privado, borrado, sin audio, etc.) --
+        solo el primer tipo de error tiene sentido reintentarlo solo."""
+        return cls._PATRON_ERROR_DE_CONEXION.search(str(e)) is not None
+
     def _worker(self):
         while True:
             link, fila = self.cola.get()
             try:
-                link_descarga, caratula_forzada = self._resolver_link(link, fila)
-                fila.set_estado("PREPARANDO", COLOR_INFO)
-                opciones = self._opciones_descarga(fila)
-                with yt_dlp.YoutubeDL(opciones) as ydl:
-                    info = ydl.extract_info(link_descarga, download=True)
-                    info = self._desenvolver_resultado_busqueda(info)
-                    archivo = self._ruta_mp3_final(ydl, info)
+                for intento in range(1, self._REINTENTOS_DESCARGA + 1):
+                    try:
+                        link_descarga, caratula_forzada = self._resolver_link(link, fila)
+                        fila.set_estado("PREPARANDO", COLOR_INFO)
+                        opciones = self._opciones_descarga(fila)
+                        with yt_dlp.YoutubeDL(opciones) as ydl:
+                            info = ydl.extract_info(link_descarga, download=True)
+                            info = self._desenvolver_resultado_busqueda(info)
+                            archivo = self._ruta_mp3_final(ydl, info)
+                        break
+                    except Exception as e:
+                        quedan_intentos = intento < self._REINTENTOS_DESCARGA
+                        if not (quedan_intentos and self._parece_error_de_conexion(e)):
+                            raise
+                        fila.set_estado(
+                            "PREPARANDO", COLOR_ADVERTENCIA,
+                            detalle=f"problema de conexion, reintentando ({intento}/{self._REINTENTOS_DESCARGA})...",
+                        )
+                        time.sleep(self._ESPERA_ENTRE_REINTENTOS_SEG)
 
                 if caratula_forzada:
                     # Es un tema que vino de Spotify: la caratula real del
