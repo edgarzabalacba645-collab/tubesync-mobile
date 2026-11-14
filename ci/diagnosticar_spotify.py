@@ -87,6 +87,17 @@ def main(link):
         idx = html_pagina.find(patron)
         print(f"{etiqueta}: {idx}")
 
+    print()
+    print("=== Texto crudo alrededor de 'music:musician_description' (+-120) ===")
+    idx = html_pagina.find("music:musician_description")
+    if idx != -1:
+        print(repr(html_pagina[max(0, idx - 60):idx + 250]))
+    print()
+    print("=== Texto crudo alrededor de 'og:description' (+-150) ===")
+    idx2 = html_pagina.find("og:description")
+    if idx2 != -1:
+        print(repr(html_pagina[max(0, idx2 - 30):idx2 + 250]))
+
 
 if __name__ == "__main__":
     main(sys.argv[1])
