@@ -215,6 +215,71 @@ except Exception:
     _CONTEXTO_SSL = None
 
 
+# --- Listeners de android.media.MediaPlayer (reproductor continuo) --------
+#
+# MediaPlayer.setOnPreparedListener/setOnCompletionListener piden una
+# instancia de una INTERFAZ Java (OnPreparedListener/OnCompletionListener,
+# con un solo metodo cada una) -- pyjnius permite implementar esas
+# interfaces desde Python con PythonJavaClass + el decorador @java_method
+# (la firma JNI exacta, tipo "(Landroid/media/MediaPlayer;)V" para un
+# metodo que recibe un MediaPlayer y no devuelve nada). Se verifico este
+# mecanismo con un ejemplo minimo local (una interfaz Java de prueba
+# compilada a mano, sin nada de Android) antes de usarlo aca: tanto
+# invocar el callback al toque como GUARDAR la referencia al listener y
+# llamarlo recien despues (que es exactamente lo que hace MediaPlayer por
+# dentro) funcionan como se espera.
+#
+# Los callbacks de MediaPlayer pueden llegar en un hilo interno de Android,
+# no en el hilo de Kivy -- por eso ambos reenvian el aviso con @mainthread
+# (_al_quedar_preparado / _al_terminar_pista en TubeSyncMobileApp) en vez
+# de tocar la UI directo desde aca.
+#
+# El resto del archivo importa "jnius" adentro de cada metodo (no aca
+# arriba) porque esas llamadas son todas autoclass() sueltas. Estas dos
+# clases, en cambio, necesitan EXTENDER PythonJavaClass en la definicion
+# de la clase misma (no se puede dejar para "mas adelante, cuando haga
+# falta") -- por eso el import esta aca, pero protegido igual que
+# _CONTEXTO_SSL mas arriba, para que el archivo siga siendo importable
+# (por ejemplo para pruebas con ast/exec) en un entorno sin pyjnius real.
+try:
+    from jnius import PythonJavaClass, java_method
+
+    class _EscuchadorPreparado(PythonJavaClass):
+        """android.media.MediaPlayer.OnPreparedListener -- avisa cuando el
+        MediaPlayer ya termino de prepararse (prepareAsync) y recien ahi es
+        seguro arrancar la reproduccion con start()."""
+
+        __javainterfaces__ = ['android/media/MediaPlayer$OnPreparedListener']
+
+        def __init__(self, app):
+            super().__init__()
+            self._app = app
+
+        @java_method('(Landroid/media/MediaPlayer;)V')
+        def onPrepared(self, mp):
+            self._app._al_quedar_preparado()
+
+    class _EscuchadorFinDePista(PythonJavaClass):
+        """android.media.MediaPlayer.OnCompletionListener -- avisa cuando el
+        tema actual termino SOLO, de principio a fin (no por pausa/stop
+        manual). Esto es lo que hace que el reproductor sea "continuo": en
+        vez de quedarse ahi parado, pasa sola al siguiente tema de la
+        lista."""
+
+        __javainterfaces__ = ['android/media/MediaPlayer$OnCompletionListener']
+
+        def __init__(self, app):
+            super().__init__()
+            self._app = app
+
+        @java_method('(Landroid/media/MediaPlayer;)V')
+        def onCompletion(self, mp):
+            self._app._al_terminar_pista()
+except Exception:
+    _EscuchadorPreparado = None
+    _EscuchadorFinDePista = None
+
+
 class Tarjeta(BoxLayout):
     """BoxLayout con fondo propio y esquinas redondeadas -- el "card" que
     se usa para el buscador de arriba y para cada fila de descarga, para
@@ -256,6 +321,29 @@ class BotonAccion(Button):
 
     def _actualizar_color(self, *_):
         self._color_fondo.rgba = self._color_press if self.state == "down" else self._color_normal
+
+
+class BotonIcono(Button):
+    """Boton chico sin fondo solido (solo el glifo, tipo "icono") -- para
+    las acciones por-fila de "Mis descargas" (reproducir/pausar, borrar).
+    BotonAccion esta pensado para la accion principal de una pantalla
+    entera (ocupa todo el ancho, fondo solido); aca al lado del nombre del
+    archivo eso se veria pesado, asi que este boton es solo texto+color,
+    con un cambio de color sutil al tocarlo en vez de un fondo que aparece."""
+
+    def __init__(self, color_normal=None, color_press=None, **kwargs):
+        kwargs.setdefault("size_hint", (None, None))
+        kwargs.setdefault("size", (dp(36), dp(36)))
+        kwargs.setdefault("font_size", dp(18))
+        super().__init__(background_normal="", background_down="", background_color=(0, 0, 0, 0), **kwargs)
+        self.bold = True
+        self._color_normal = color_normal or COLOR_TEXTO
+        self._color_press = color_press or COLOR_ACENTO
+        self.color = self._color_normal
+        self.bind(state=self._actualizar_color)
+
+    def _actualizar_color(self, *_):
+        self.color = self._color_press if self.state == "down" else self._color_normal
 
 
 class BarraProgreso(Widget):
@@ -323,14 +411,17 @@ class Insignia(BoxLayout):
 class BarraAcento(Widget):
     """Tira vertical de color -- acento a la izquierda de cada item de "Mis
     descargas", para diferenciarlo visualmente de las filas de descarga
-    activa (que usan chip + barra de progreso)."""
+    activa (que usan chip + barra de progreso). Guarda la instruccion
+    Color (self._color) para poder cambiarle el color despues con
+    set_color -- se usa para resaltar en la lista cual tema es el que
+    esta sonando ahora."""
 
     def __init__(self, color=COLOR_INFO, **kwargs):
         kwargs.setdefault("size_hint_x", None)
         kwargs.setdefault("width", dp(4))
         super().__init__(**kwargs)
         with self.canvas:
-            Color(*color)
+            self._color = Color(*color)
             self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(2)])
         self.bind(pos=self._redibujar, size=self._redibujar)
 
@@ -375,14 +466,23 @@ class BotonPestana(Button):
 
 class TarjetaDescarga(Tarjeta):
     """Un item de la pestana "Mis descargas": nombre del archivo + tamano,
-    con una tira de acento turquesa a la izquierda."""
+    con una tira de acento a la izquierda (turquesa normalmente, acento
+    rojo/coral cuando ESTE es el tema que esta sonando), un boton de
+    reproducir/pausar y un boton de borrar individual (a diferencia de
+    "BORRAR TODO", que borra la lista entera)."""
 
-    def __init__(self, nombre_archivo, tam_mb, **kwargs):
+    def __init__(self, id_mediastore, nombre_archivo, tam_mb,
+                 en_reproduccion=False, pausado=False, al_reproducir=None, al_borrar=None, **kwargs):
         super().__init__(
             orientation="horizontal", size_hint_y=None, height=dp(58),
-            padding=(dp(12), dp(8)), spacing=dp(12), **kwargs,
+            padding=(dp(12), dp(8)), spacing=dp(10), **kwargs,
         )
-        self.add_widget(BarraAcento())
+        self.id_mediastore = id_mediastore
+        self.nombre_archivo = nombre_archivo
+
+        self.acento = BarraAcento()
+        self.add_widget(self.acento)
+
         columna = BoxLayout(orientation="vertical", spacing=dp(2))
         titulo = Label(
             text=os.path.splitext(nombre_archivo)[0],
@@ -401,6 +501,26 @@ class TarjetaDescarga(Tarjeta):
         columna.add_widget(titulo)
         columna.add_widget(subtitulo)
         self.add_widget(columna)
+
+        self.boton_play = BotonIcono(text="")
+        if al_reproducir:
+            self.boton_play.bind(on_release=lambda *_: al_reproducir())
+        self.add_widget(self.boton_play)
+
+        boton_borrar = BotonIcono(text="x", color_normal=COLOR_TEXTO_MUTE, color_press=COLOR_ERROR)
+        if al_borrar:
+            boton_borrar.bind(on_release=lambda *_: al_borrar())
+        self.add_widget(boton_borrar)
+
+        self.set_en_reproduccion(en_reproduccion, pausado)
+
+    def set_en_reproduccion(self, activo, pausado=False):
+        """Pinta esta tarjeta como "la que esta sonando ahora" (tira de
+        acento rojo/coral en vez de turquesa) y cambia el glifo del boton
+        de reproducir segun corresponda: ► para arrancar/reanudar, ❙❙ para
+        pausar la que ya esta sonando."""
+        self.acento._color.rgba = COLOR_ACENTO if activo else COLOR_INFO
+        self.boton_play.text = "▶" if (not activo or pausado) else "❙❙"
 
 
 class FilaDescarga(Tarjeta):
@@ -593,12 +713,57 @@ class TubeSyncMobileApp(App):
         scroll_descargas.add_widget(self.lista_descargas)
         self.vista_descargas.add_widget(scroll_descargas)
 
+        # --- Barra del reproductor continuo (abajo de "Mis descargas") ----
+        # Arrancan ocultas (altura 0) -- recien se muestran cuando se pone a
+        # sonar el primer tema (ver _mostrar_barra_reproductor).
+        self.barra_reproductor = Tarjeta(
+            orientation="horizontal", size_hint_y=None, height=0, opacity=0,
+            padding=(dp(14), dp(8)), spacing=dp(10),
+        )
+        self.label_pista_actual = Label(
+            text="", color=COLOR_TEXTO, font_size=dp(12), bold=True,
+            halign="left", valign="middle", shorten=True, shorten_from="right",
+        )
+        self.label_pista_actual.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        self.boton_pista_anterior = BotonIcono(text="⏮")
+        self.boton_pista_anterior.bind(on_release=lambda *_: self._pista_anterior())
+        self.boton_play_pausa_barra = BotonIcono(text="▶")
+        self.boton_play_pausa_barra.bind(on_release=lambda *_: self._alternar_reproduccion_actual())
+        self.boton_pista_siguiente = BotonIcono(text="⏭")
+        self.boton_pista_siguiente.bind(on_release=lambda *_: self._siguiente_pista())
+        self.barra_reproductor.add_widget(self.label_pista_actual)
+        self.barra_reproductor.add_widget(self.boton_pista_anterior)
+        self.barra_reproductor.add_widget(self.boton_play_pausa_barra)
+        self.barra_reproductor.add_widget(self.boton_pista_siguiente)
+        self.vista_descargas.add_widget(self.barra_reproductor)
+
         raiz.add_widget(contenido)
 
         self._cambiar_pestana("nueva")
 
+        # --- Estado del reproductor continuo -------------------------------
+        # self._archivos_actuales: la MISMA lista que esta mostrando "Mis
+        #   descargas" ahora (id, nombre, tam_mb) -- el orden define en que
+        #   orden "siguiente/anterior" avanzan.
+        # self._id_reproduciendo: id de MediaStore del tema actual, o None
+        #   si no hay nada sonando.
+        # self._reproductor: el android.media.MediaPlayer real (via
+        #   pyjnius), o None.
+        # self._tarjetas_por_id: id -> TarjetaDescarga visible ahora mismo,
+        #   para poder resaltar/despintar sin reconstruir toda la lista.
+        self._archivos_actuales = []
+        self._id_reproduciendo = None
+        self._reproductor = None
+        self._pausado = False
+        self._tarjetas_por_id = {}
+
         threading.Thread(target=self._worker, daemon=True).start()
         return raiz
+
+    def on_stop(self):
+        """Libera el MediaPlayer nativo al cerrar la app -- sin esto el
+        objeto Java queda vivo en el proceso aunque Python ya no lo use."""
+        self._detener_reproduccion()
 
     def _cambiar_pestana(self, nombre):
         self.boton_tab_nueva.set_activo(nombre == "nueva")
@@ -622,7 +787,12 @@ class TubeSyncMobileApp(App):
         activity = PythonActivity.mActivity
         resolver = activity.getContentResolver()
 
-        proyeccion = ["_display_name", "_size"]
+        # "_id" (el id de MediaStore de cada fila) hace falta para poder
+        # reproducir/borrar UN solo tema despues (armar su content:// Uri
+        # exacto con ContentUris.withAppendedId) -- antes no se pedia
+        # porque "Borrar todo" borra por relative_path, sin necesitar el id
+        # de cada fila individual.
+        proyeccion = ["_id", "_display_name", "_size"]
         cursor = resolver.query(
             MediaStoreDownloads.EXTERNAL_CONTENT_URI,
             proyeccion,
@@ -633,12 +803,14 @@ class TubeSyncMobileApp(App):
         resultado = []
         if cursor is not None:
             try:
+                idx_id = cursor.getColumnIndexOrThrow("_id")
                 idx_nombre = cursor.getColumnIndexOrThrow("_display_name")
                 idx_tam = cursor.getColumnIndexOrThrow("_size")
                 while cursor.moveToNext():
+                    id_mediastore = cursor.getLong(idx_id)
                     nombre = cursor.getString(idx_nombre)
                     tam_bytes = cursor.getLong(idx_tam)
-                    resultado.append((nombre, tam_bytes / 1024 / 1024))
+                    resultado.append((id_mediastore, nombre, tam_bytes / 1024 / 1024))
             finally:
                 cursor.close()
         return resultado
@@ -646,19 +818,33 @@ class TubeSyncMobileApp(App):
     def _refrescar_descargas(self):
         """Vuelve a consultar la carpeta publica de Descargas y arma la
         lista de la pestana "Mis descargas". Se llama cada vez que se entra
-        a esa pestana (no hace falta que corra sola en segundo plano)."""
+        a esa pestana (no hace falta que corra sola en segundo plano).
+
+        Si hay un tema sonando, lo vuelve a resaltar en la lista nueva
+        (buscandolo por id, no por posicion -- la posicion puede cambiar si
+        se agrego o borro algo)."""
         self.lista_descargas.clear_widgets()
+        self._tarjetas_por_id = {}
         try:
             archivos = self._consultar_descargas_publicas()
         except Exception:
             traceback.print_exc()
             archivos = []
+        self._archivos_actuales = archivos
         hay_archivos = bool(archivos)
         self.label_descargas_vacio.opacity = 0 if hay_archivos else 1
         self.label_descargas_vacio.size_hint_y = 0 if hay_archivos else None
         self.label_descargas_vacio.height = 0 if hay_archivos else dp(50)
-        for nombre, tam_mb in archivos:
-            self.lista_descargas.add_widget(TarjetaDescarga(nombre, tam_mb))
+        for id_mediastore, nombre, tam_mb in archivos:
+            tarjeta = TarjetaDescarga(
+                id_mediastore, nombre, tam_mb,
+                en_reproduccion=(id_mediastore == self._id_reproduciendo),
+                pausado=self._pausado if id_mediastore == self._id_reproduciendo else False,
+                al_reproducir=lambda id_mediastore=id_mediastore: self._tocar_o_pausar(id_mediastore),
+                al_borrar=lambda id_mediastore=id_mediastore, nombre=nombre: self._confirmar_borrar_uno(id_mediastore, nombre),
+            )
+            self._tarjetas_por_id[id_mediastore] = tarjeta
+            self.lista_descargas.add_widget(tarjeta)
 
     def _confirmar_borrar_todo(self):
         """Antes de borrar archivos de verdad (irreversible), pide
@@ -691,6 +877,7 @@ class TubeSyncMobileApp(App):
 
         def _confirmar(*_):
             popup.dismiss()
+            self._detener_reproduccion()  # va a borrar TODO, incluido lo que esta sonando
             self._borrar_todas_las_descargas()
             self._refrescar_descargas()
 
@@ -716,6 +903,254 @@ class TubeSyncMobileApp(App):
             )
         except Exception:
             traceback.print_exc()
+
+    def _confirmar_borrar_uno(self, id_mediastore, nombre_archivo):
+        """Lo mismo que _confirmar_borrar_todo pero para UN solo archivo --
+        pedido explicito de Edgar ("podés agregar la opción de botar temas
+        sueltos? Ahora borra todo junto"). Mismo popup de confirmacion,
+        mismo estilo, pero borra solo esta fila."""
+        caja = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(14))
+        caja.add_widget(
+            Label(
+                text=f"¿Borrar \"{os.path.splitext(nombre_archivo)[0]}\"?\nEsta accion no se puede deshacer.",
+                color=COLOR_TEXTO,
+                halign="center",
+                valign="middle",
+            )
+        )
+        fila_botones = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(48), spacing=dp(10))
+        boton_cancelar = BotonAccion(text="CANCELAR", color_normal=COLOR_TARJETA, color_press=COLOR_FONDO)
+        boton_borrar = BotonAccion(text="BORRAR", color_normal=COLOR_ERROR, color_press=COLOR_ACENTO_OSCURO)
+        fila_botones.add_widget(boton_cancelar)
+        fila_botones.add_widget(boton_borrar)
+        caja.add_widget(fila_botones)
+
+        popup = Popup(
+            title="Confirmar borrado",
+            content=caja,
+            size_hint=(0.85, None),
+            height=dp(190),
+            separator_color=COLOR_ACENTO,
+            background_color=COLOR_FONDO,
+        )
+        boton_cancelar.bind(on_release=popup.dismiss)
+
+        def _confirmar(*_):
+            popup.dismiss()
+            if id_mediastore == self._id_reproduciendo:
+                self._detener_reproduccion()  # se esta borrando el tema que suena ahora
+            self._borrar_una_descarga(id_mediastore)
+            self._refrescar_descargas()
+
+        boton_borrar.bind(on_release=_confirmar)
+        popup.open()
+
+    def _borrar_una_descarga(self, id_mediastore):
+        """Borra un solo archivo (una sola fila de MediaStore) por su id,
+        a diferencia de _borrar_todas_las_descargas que borra por
+        relative_path (todo lo que hay en la subcarpeta). Se arma el Uri
+        exacto de esa fila con ContentUris.withAppendedId -- el mismo
+        patron que recomienda la documentacion de Android para apuntar a
+        un item puntual de una coleccion de MediaStore."""
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
+            ContentUris = autoclass("android.content.ContentUris")
+            activity = PythonActivity.mActivity
+            resolver = activity.getContentResolver()
+            uri_item = ContentUris.withAppendedId(MediaStoreDownloads.EXTERNAL_CONTENT_URI, id_mediastore)
+            resolver.delete(uri_item, None, None)
+        except Exception:
+            traceback.print_exc()
+
+    # --- Reproductor continuo -------------------------------------------
+    #
+    # Edgar lo pidio explicitamente: "No tengo en mi celu un reproductor
+    # continuo... Es posible que de descargar pueda reproducir los temas
+    # descargados cómo cualquier reproductor normal?". Se implementa con
+    # android.media.MediaPlayer nativo (via pyjnius), NO con
+    # kivy.core.audio.SoundLoader, por una razon concreta de permisos:
+    #
+    # Esta app no declara NINGUN permiso de almacenamiento (ver
+    # android.permissions en buildozer.spec -- solo esta INTERNET). Eso
+    # funciona porque los mp3 se escriben en la carpeta publica de
+    # Descargas via MediaStore (resolver.insert + openOutputStream, ver
+    # _publicar_en_musica), y bajo "scoped storage" (Android 10+) una app
+    # tiene acceso de lectura/escritura/borrado SIN permisos especiales a
+    # las filas de MediaStore que ELLA MISMA creo -- eso es justamente lo
+    # que ya hace _borrar_todas_las_descargas/_consultar_descargas_publicas
+    # con exito. Pero ese acceso es a traves del content:// Uri, NO de un
+    # path de archivo de verdad (eso es la esencia de scoped storage). Un
+    # SoundLoader de Kivy espera un path de archivo normal, no un content
+    # Uri -- usarlo aca obligaria a conseguir un path real, lo cual
+    # necesitaria permisos amplios de almacenamiento que hoy esta app no
+    # tiene (y pedirlos es justo lo que "scoped storage" esta pensado para
+    # evitar).
+    #
+    # android.media.MediaPlayer, en cambio, tiene un metodo pensado
+    # EXACTAMENTE para este caso: setDataSource(Context, Uri) -- soporta
+    # content:// Uris de forma nativa y oficial (documentado en
+    # developer.android.com/media/platform/mediaplayer/resolver). Como ya
+    # se usa pyjnius en el resto del archivo para hablar con MediaStore, es
+    # el mismo mecanismo, sin agregar ninguna libreria nueva ni pedir
+    # ningun permiso nuevo.
+
+    def _obtener_uri_mediastore(self, id_mediastore):
+        from jnius import autoclass
+
+        MediaStoreDownloads = autoclass("android.provider.MediaStore$Downloads")
+        ContentUris = autoclass("android.content.ContentUris")
+        return ContentUris.withAppendedId(MediaStoreDownloads.EXTERNAL_CONTENT_URI, id_mediastore)
+
+    def _tocar_o_pausar(self, id_mediastore):
+        """Lo que llama el boton de play/pausa de UNA fila de la lista (o
+        el de la barra de abajo, para el tema actual): si ya es el tema
+        que esta sonando, alterna pausa/reanudar; si es otro distinto,
+        arranca ese desde cero (soltando el anterior)."""
+        if id_mediastore == self._id_reproduciendo:
+            self._alternar_reproduccion_actual()
+        else:
+            self._iniciar_reproduccion(id_mediastore)
+
+    def _alternar_reproduccion_actual(self):
+        """Pausa/reanuda el tema que ya esta cargado -- no crea un
+        MediaPlayer nuevo, asi que es instantaneo (sin el pequeno delay de
+        volver a prepararlo)."""
+        if self._reproductor is None:
+            return
+        try:
+            if self._pausado:
+                self._reproductor.start()
+                self._pausado = False
+            else:
+                self._reproductor.pause()
+                self._pausado = True
+        except Exception:
+            traceback.print_exc()
+            return
+        self._actualizar_ui_reproductor()
+
+    def _iniciar_reproduccion(self, id_mediastore):
+        """Arranca (desde cero) la reproduccion del tema con ese id de
+        MediaStore -- suelta el MediaPlayer anterior si habia uno
+        (MediaPlayer no se reutiliza entre archivos distintos, hay que
+        armar uno nuevo por cada datasource)."""
+        self._liberar_reproductor_actual()
+
+        datos = next((a for a in self._archivos_actuales if a[0] == id_mediastore), None)
+        if datos is None:
+            return
+        _id, nombre, _tam = datos
+
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            MediaPlayer = autoclass("android.media.MediaPlayer")
+            activity = PythonActivity.mActivity
+            uri = self._obtener_uri_mediastore(id_mediastore)
+
+            reproductor = MediaPlayer()
+            reproductor.setOnPreparedListener(_EscuchadorPreparado(self))
+            reproductor.setOnCompletionListener(_EscuchadorFinDePista(self))
+            reproductor.setDataSource(activity, uri)
+            # prepareAsync() (no prepare()) para no bloquear el hilo de UI
+            # de Kivy ni un instante -- arranca a sonar solo una vez que
+            # termine de prepararse, en _EscuchadorPreparado.
+            reproductor.prepareAsync()
+        except Exception:
+            traceback.print_exc()
+            return
+
+        self._reproductor = reproductor
+        self._id_reproduciendo = id_mediastore
+        self._pausado = False
+        self.label_pista_actual.text = os.path.splitext(nombre)[0]
+        self._mostrar_barra_reproductor(True)
+        self._actualizar_ui_reproductor()
+
+    @mainthread
+    def _al_quedar_preparado(self):
+        """Callback (ya reencolado en el hilo de Kivy, ver
+        _EscuchadorPreparado) de que el MediaPlayer ya termino de
+        prepararse -- recien aca es seguro llamar start()."""
+        if self._reproductor is None:
+            return
+        try:
+            self._reproductor.start()
+        except Exception:
+            traceback.print_exc()
+        self._actualizar_ui_reproductor()
+
+    @mainthread
+    def _al_terminar_pista(self):
+        """Callback (ya reencolado en el hilo de Kivy, ver
+        _EscuchadorFinDePista) de que el tema actual termino solo, de
+        principio a fin -- esto es lo que hace que sea un "reproductor
+        CONTINUO": en vez de quedarse parado, pasa sola a la siguiente."""
+        self._siguiente_pista(desde_fin_natural=True)
+
+    def _pista_anterior(self):
+        self._mover_pista(-1)
+
+    def _siguiente_pista(self, desde_fin_natural=False):
+        self._mover_pista(1, parar_si_no_hay_mas=desde_fin_natural)
+
+    def _mover_pista(self, delta, parar_si_no_hay_mas=False):
+        """Avanza/retrocede dentro de self._archivos_actuales (el mismo
+        orden que se ve en "Mis descargas", mas nuevo primero). Si no hay
+        nada sonando todavia, +1/-1 arranca desde la primera/ultima."""
+        ids = [a[0] for a in self._archivos_actuales]
+        if not ids:
+            return
+        if self._id_reproduciendo in ids:
+            indice = ids.index(self._id_reproduciendo) + delta
+        else:
+            indice = 0 if delta > 0 else len(ids) - 1
+        if indice < 0 or indice >= len(ids):
+            if parar_si_no_hay_mas:
+                self._detener_reproduccion()
+            return
+        self._iniciar_reproduccion(ids[indice])
+
+    def _liberar_reproductor_actual(self):
+        if self._reproductor is not None:
+            try:
+                self._reproductor.release()
+            except Exception:
+                traceback.print_exc()
+            self._reproductor = None
+
+    def _detener_reproduccion(self):
+        """Para la reproduccion por completo (no es "pausa"): suelta el
+        MediaPlayer, limpia el estado y oculta la barra de abajo. Se usa
+        al cerrar la app, al borrar el tema que esta sonando, o al llegar
+        al final de la lista en modo "continuo"."""
+        self._liberar_reproductor_actual()
+        id_anterior = self._id_reproduciendo
+        self._id_reproduciendo = None
+        self._pausado = False
+        self._mostrar_barra_reproductor(False)
+        if id_anterior is not None:
+            tarjeta = self._tarjetas_por_id.get(id_anterior)
+            if tarjeta is not None:
+                tarjeta.set_en_reproduccion(False)
+
+    @mainthread
+    def _mostrar_barra_reproductor(self, visible):
+        self.barra_reproductor.opacity = 1 if visible else 0
+        self.barra_reproductor.height = dp(52) if visible else 0
+
+    @mainthread
+    def _actualizar_ui_reproductor(self):
+        """Pinta la tarjeta correcta como "sonando" (y despinta cualquier
+        otra) y pone el glifo correcto (► / ❙❙) tanto en esa tarjeta como
+        en la barra de abajo."""
+        for id_fila, tarjeta in self._tarjetas_por_id.items():
+            tarjeta.set_en_reproduccion(id_fila == self._id_reproduciendo, self._pausado)
+        self.boton_play_pausa_barra.text = "▶" if self._pausado else "❙❙"
 
     def _actualizar_estado_vacio(self):
         self.label_vacio.opacity = 0 if self.lista.children else 1
