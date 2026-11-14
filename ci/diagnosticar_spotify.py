@@ -75,6 +75,17 @@ def main(link):
     # propios ojos, no adivinar.
     print("=== Primeros 1500 caracteres del HTML crudo ===")
     print(html_pagina[:1500])
+    print()
+    print("=== Posicion (indice de caracter) de cada tag clave en el HTML ===")
+    for etiqueta, patron in (
+        ("</title>", "</title>"),
+        ("music:musician_description", "music:musician_description"),
+        ("og:description", "og:description"),
+        ("og:image", "og:image"),
+        ("</head>", "</head>"),
+    ):
+        idx = html_pagina.find(patron)
+        print(f"{etiqueta}: {idx}")
 
 
 if __name__ == "__main__":
