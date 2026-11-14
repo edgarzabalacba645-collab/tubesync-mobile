@@ -74,9 +74,9 @@ import urllib.parse
 import urllib.request
 
 from kivy.app import App
-from kivy.clock import mainthread
+from kivy.clock import Clock, mainthread
 from kivy.core.window import Window
-from kivy.graphics import Color, RoundedRectangle
+from kivy.graphics import Color, Rectangle, RoundedRectangle, Triangle
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -325,13 +325,27 @@ class BotonAccion(Button):
 
 class BotonIcono(Button):
     """Boton chico sin fondo solido (solo el glifo, tipo "icono") -- para
-    las acciones por-fila de "Mis descargas" (reproducir/pausar, borrar).
+    las acciones por-fila de "Mis descargas" (reproducir/pausar, borrar) y
+    los controles de la barra del reproductor (anterior/siguiente).
     BotonAccion esta pensado para la accion principal de una pantalla
     entera (ocupa todo el ancho, fondo solido); aca al lado del nombre del
-    archivo eso se veria pesado, asi que este boton es solo texto+color,
-    con un cambio de color sutil al tocarlo en vez de un fondo que aparece."""
+    archivo eso se veria pesado, asi que este boton es solo icono/texto+
+    color, con un cambio de color sutil al tocarlo en vez de un fondo que
+    aparece.
 
-    def __init__(self, color_normal=None, color_press=None, **kwargs):
+    Con icono="play"/"pausa"/"anterior"/"siguiente" el "icono" se DIBUJA a
+    mano con Triangle/Rectangle (no se usa texto): los simbolos Unicode de
+    controles de reproduccion (▶ ❙❙ ⏮ ⏭) resultaron no estar en la fuente
+    que trae Android por default en el telefono de Edgar (POCO M6 Pro) --
+    se vieron como cuadrados vacios ("tofu"), un problema real reportado
+    con captura de pantalla, no hipotetico. Dibujando la forma nosotros
+    mismos (lo mismo que ya hace el resto del archivo para las barras e
+    insignias, via Color + instrucciones de canvas) el icono se ve igual
+    sin importar que fuente tenga el telefono. Sin "icono" (el boton de
+    borrar, "x") se sigue usando texto normal -- esa "x" SI se vio bien en
+    la captura de Edgar, por eso no hacia falta cambiarla."""
+
+    def __init__(self, color_normal=None, color_press=None, icono=None, **kwargs):
         kwargs.setdefault("size_hint", (None, None))
         kwargs.setdefault("size", (dp(36), dp(36)))
         kwargs.setdefault("font_size", dp(18))
@@ -340,10 +354,67 @@ class BotonIcono(Button):
         self._color_normal = color_normal or COLOR_TEXTO
         self._color_press = color_press or COLOR_ACENTO
         self.color = self._color_normal
+        self._icono = icono
+        self._color_icono = None
+        self._formas_icono = []
+        if icono:
+            with self.canvas:
+                self._color_icono = Color(*self._color_normal)
+            self.bind(pos=self._redibujar_icono, size=self._redibujar_icono)
+            self._redibujar_icono()
         self.bind(state=self._actualizar_color)
 
     def _actualizar_color(self, *_):
-        self.color = self._color_press if self.state == "down" else self._color_normal
+        color = self._color_press if self.state == "down" else self._color_normal
+        self.color = color
+        if self._color_icono is not None:
+            self._color_icono.rgba = color
+
+    def set_icono(self, icono):
+        """Cambia que icono dibuja este boton -- lo usa el boton de
+        play/pausa de la barra de abajo, que alterna entre "play" y
+        "pausa" segun el estado de la reproduccion."""
+        self._icono = icono
+        self._redibujar_icono()
+
+    def _redibujar_icono(self, *_):
+        for forma in self._formas_icono:
+            self.canvas.remove(forma)
+        self._formas_icono = []
+        if not self._icono:
+            return
+        cx, cy = self.center
+        # "radio" del icono -- deja aire alrededor para que no toque los
+        # bordes del area tocable del boton.
+        r = min(self.width, self.height) * 0.28
+        with self.canvas:
+            if self._icono == "play":
+                self._formas_icono.append(Triangle(points=[
+                    cx - r * 0.7, cy - r,
+                    cx - r * 0.7, cy + r,
+                    cx + r, cy,
+                ]))
+            elif self._icono == "pausa":
+                ancho = r * 0.55
+                hueco = r * 0.3
+                self._formas_icono.append(
+                    Rectangle(pos=(cx - hueco - ancho, cy - r), size=(ancho, r * 2)))
+                self._formas_icono.append(
+                    Rectangle(pos=(cx + hueco, cy - r), size=(ancho, r * 2)))
+            elif self._icono == "siguiente":
+                self._formas_icono.append(Triangle(points=[
+                    cx - r, cy - r, cx - r, cy + r, cx, cy,
+                ]))
+                self._formas_icono.append(Triangle(points=[
+                    cx, cy - r, cx, cy + r, cx + r, cy,
+                ]))
+            elif self._icono == "anterior":
+                self._formas_icono.append(Triangle(points=[
+                    cx + r, cy - r, cx + r, cy + r, cx, cy,
+                ]))
+                self._formas_icono.append(Triangle(points=[
+                    cx, cy - r, cx, cy + r, cx - r, cy,
+                ]))
 
 
 class BarraProgreso(Widget):
@@ -375,6 +446,28 @@ class BarraProgreso(Widget):
     def set_valor(self, valor):
         self.valor = max(0, min(100, valor))
         self._redibujar()
+
+
+class BarraSeek(BarraProgreso):
+    """La misma barra visual que BarraProgreso (la de descarga), pero
+    TOCABLE: tocar en cualquier punto busca (seek) hasta esa posicion del
+    tema que esta sonando -- pedido explicito de Edgar ("una linea de
+    tiempo del tema, toca en cualquier parte para avanzar hasta alli").
+    Mas alta que la de descarga (mas facil de tocar con el dedo)."""
+
+    def __init__(self, al_tocar=None, **kwargs):
+        kwargs.setdefault("height", dp(14))
+        super().__init__(**kwargs)
+        self.al_tocar = al_tocar
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos) and self.al_tocar:
+            fraccion = (touch.x - self.x) / self.width if self.width else 0
+            fraccion = max(0.0, min(1.0, fraccion))
+            self.set_valor(fraccion * 100)  # respuesta visual inmediata, sin esperar la proxima actualizacion
+            self.al_tocar(fraccion)
+            return True
+        return super().on_touch_down(touch)
 
 
 class Insignia(BoxLayout):
@@ -502,7 +595,7 @@ class TarjetaDescarga(Tarjeta):
         columna.add_widget(subtitulo)
         self.add_widget(columna)
 
-        self.boton_play = BotonIcono(text="")
+        self.boton_play = BotonIcono(icono="play")
         if al_reproducir:
             self.boton_play.bind(on_release=lambda *_: al_reproducir())
         self.add_widget(self.boton_play)
@@ -516,11 +609,11 @@ class TarjetaDescarga(Tarjeta):
 
     def set_en_reproduccion(self, activo, pausado=False):
         """Pinta esta tarjeta como "la que esta sonando ahora" (tira de
-        acento rojo/coral en vez de turquesa) y cambia el glifo del boton
-        de reproducir segun corresponda: ► para arrancar/reanudar, ❙❙ para
-        pausar la que ya esta sonando."""
+        acento rojo/coral en vez de turquesa) y cambia el icono del boton
+        de reproducir segun corresponda: play para arrancar/reanudar,
+        pausa para pausar la que ya esta sonando."""
         self.acento._color.rgba = COLOR_ACENTO if activo else COLOR_INFO
-        self.boton_play.text = "▶" if (not activo or pausado) else "❙❙"
+        self.boton_play.set_icono("play" if (not activo or pausado) else "pausa")
 
 
 class FilaDescarga(Tarjeta):
@@ -714,27 +807,48 @@ class TubeSyncMobileApp(App):
         self.vista_descargas.add_widget(scroll_descargas)
 
         # --- Barra del reproductor continuo (abajo de "Mis descargas") ----
-        # Arrancan ocultas (altura 0) -- recien se muestran cuando se pone a
-        # sonar el primer tema (ver _mostrar_barra_reproductor).
+        # Arranca oculta (altura 0) -- recien se muestra cuando se pone a
+        # sonar el primer tema (ver _mostrar_barra_reproductor). Tres filas:
+        # nombre del tema, linea de tiempo tocable (BarraSeek) + reloj, y
+        # los controles anterior/play-pausa/siguiente.
         self.barra_reproductor = Tarjeta(
-            orientation="horizontal", size_hint_y=None, height=0, opacity=0,
-            padding=(dp(14), dp(8)), spacing=dp(10),
+            orientation="vertical", size_hint_y=None, height=0, opacity=0,
+            padding=(dp(14), dp(8)), spacing=dp(6),
         )
         self.label_pista_actual = Label(
             text="", color=COLOR_TEXTO, font_size=dp(12), bold=True,
             halign="left", valign="middle", shorten=True, shorten_from="right",
+            size_hint_y=None, height=dp(18),
         )
         self.label_pista_actual.bind(size=lambda inst, val: setattr(inst, "text_size", val))
-        self.boton_pista_anterior = BotonIcono(text="⏮")
-        self.boton_pista_anterior.bind(on_release=lambda *_: self._pista_anterior())
-        self.boton_play_pausa_barra = BotonIcono(text="▶")
-        self.boton_play_pausa_barra.bind(on_release=lambda *_: self._alternar_reproduccion_actual())
-        self.boton_pista_siguiente = BotonIcono(text="⏭")
-        self.boton_pista_siguiente.bind(on_release=lambda *_: self._siguiente_pista())
         self.barra_reproductor.add_widget(self.label_pista_actual)
-        self.barra_reproductor.add_widget(self.boton_pista_anterior)
-        self.barra_reproductor.add_widget(self.boton_play_pausa_barra)
-        self.barra_reproductor.add_widget(self.boton_pista_siguiente)
+
+        self.barra_seek = BarraSeek(al_tocar=self._buscar_posicion)
+        self.barra_reproductor.add_widget(self.barra_seek)
+
+        self.label_tiempo = Label(
+            text="0:00 / 0:00", color=COLOR_TEXTO_MUTE, font_size=dp(10),
+            halign="right", valign="middle", size_hint_y=None, height=dp(14),
+        )
+        self.label_tiempo.bind(size=lambda inst, val: setattr(inst, "text_size", val))
+        self.barra_reproductor.add_widget(self.label_tiempo)
+
+        fila_controles = BoxLayout(
+            orientation="horizontal", size_hint_y=None, height=dp(40), spacing=dp(16),
+        )
+        fila_controles.add_widget(Widget())  # espaciador, para centrar los 3 botones
+        self.boton_pista_anterior = BotonIcono(icono="anterior")
+        self.boton_pista_anterior.bind(on_release=lambda *_: self._pista_anterior())
+        self.boton_play_pausa_barra = BotonIcono(icono="play")
+        self.boton_play_pausa_barra.bind(on_release=lambda *_: self._alternar_reproduccion_actual())
+        self.boton_pista_siguiente = BotonIcono(icono="siguiente")
+        self.boton_pista_siguiente.bind(on_release=lambda *_: self._siguiente_pista())
+        fila_controles.add_widget(self.boton_pista_anterior)
+        fila_controles.add_widget(self.boton_play_pausa_barra)
+        fila_controles.add_widget(self.boton_pista_siguiente)
+        fila_controles.add_widget(Widget())  # espaciador
+        self.barra_reproductor.add_widget(fila_controles)
+
         self.vista_descargas.add_widget(self.barra_reproductor)
 
         raiz.add_widget(contenido)
@@ -751,11 +865,17 @@ class TubeSyncMobileApp(App):
         #   pyjnius), o None.
         # self._tarjetas_por_id: id -> TarjetaDescarga visible ahora mismo,
         #   para poder resaltar/despintar sin reconstruir toda la lista.
+        # self._duracion_actual_ms: duracion del tema actual (la da
+        #   MediaPlayer.getDuration(), solo valida una vez preparado).
+        # self._intervalo_posicion: el ClockEvent que actualiza la barra de
+        #   tiempo cada medio segundo mientras hay algo cargado, o None.
         self._archivos_actuales = []
         self._id_reproduciendo = None
         self._reproductor = None
         self._pausado = False
         self._tarjetas_por_id = {}
+        self._duracion_actual_ms = 0
+        self._intervalo_posicion = None
 
         threading.Thread(target=self._worker, daemon=True).start()
         return raiz
@@ -1067,7 +1187,10 @@ class TubeSyncMobileApp(App):
         self._reproductor = reproductor
         self._id_reproduciendo = id_mediastore
         self._pausado = False
+        self._duracion_actual_ms = 0
         self.label_pista_actual.text = os.path.splitext(nombre)[0]
+        self.barra_seek.set_valor(0)
+        self.label_tiempo.text = "0:00 / 0:00"
         self._mostrar_barra_reproductor(True)
         self._actualizar_ui_reproductor()
 
@@ -1075,13 +1198,16 @@ class TubeSyncMobileApp(App):
     def _al_quedar_preparado(self):
         """Callback (ya reencolado en el hilo de Kivy, ver
         _EscuchadorPreparado) de que el MediaPlayer ya termino de
-        prepararse -- recien aca es seguro llamar start()."""
+        prepararse -- recien aca es seguro llamar start() o pedirle la
+        duracion (getDuration() antes de esto no es confiable)."""
         if self._reproductor is None:
             return
         try:
             self._reproductor.start()
+            self._duracion_actual_ms = self._reproductor.getDuration()
         except Exception:
             traceback.print_exc()
+        self._reiniciar_intervalo_posicion()
         self._actualizar_ui_reproductor()
 
     @mainthread
@@ -1116,6 +1242,7 @@ class TubeSyncMobileApp(App):
         self._iniciar_reproduccion(ids[indice])
 
     def _liberar_reproductor_actual(self):
+        self._cancelar_intervalo_posicion()
         if self._reproductor is not None:
             try:
                 self._reproductor.release()
@@ -1132,6 +1259,7 @@ class TubeSyncMobileApp(App):
         id_anterior = self._id_reproduciendo
         self._id_reproduciendo = None
         self._pausado = False
+        self._duracion_actual_ms = 0
         self._mostrar_barra_reproductor(False)
         if id_anterior is not None:
             tarjeta = self._tarjetas_por_id.get(id_anterior)
@@ -1141,16 +1269,65 @@ class TubeSyncMobileApp(App):
     @mainthread
     def _mostrar_barra_reproductor(self, visible):
         self.barra_reproductor.opacity = 1 if visible else 0
-        self.barra_reproductor.height = dp(52) if visible else 0
+        self.barra_reproductor.height = dp(120) if visible else 0
 
     @mainthread
     def _actualizar_ui_reproductor(self):
         """Pinta la tarjeta correcta como "sonando" (y despinta cualquier
-        otra) y pone el glifo correcto (► / ❙❙) tanto en esa tarjeta como
-        en la barra de abajo."""
+        otra) y pone el icono correcto (play/pausa) tanto en esa tarjeta
+        como en la barra de abajo."""
         for id_fila, tarjeta in self._tarjetas_por_id.items():
             tarjeta.set_en_reproduccion(id_fila == self._id_reproduciendo, self._pausado)
-        self.boton_play_pausa_barra.text = "▶" if self._pausado else "❙❙"
+        self.boton_play_pausa_barra.set_icono("play" if self._pausado else "pausa")
+
+    # --- Linea de tiempo / buscar posicion (seek) -----------------------
+    #
+    # Edgar lo pidio explicitamente: "Le pide agregar para adelantar un
+    # poco el tema... O una linea de tiempo del tema, toca en cualquier
+    # parte para avanzar hasta alli". MediaPlayer no avisa solo cuando
+    # cambia de posicion (no hay un "OnPositionChangedListener") -- hay
+    # que ir PREGUNTANDOLE la posicion actual cada tanto con
+    # getCurrentPosition() y pintar la barra a mano. seekTo(ms) es lo que
+    # mueve la reproduccion cuando se toca la barra.
+
+    def _reiniciar_intervalo_posicion(self):
+        self._cancelar_intervalo_posicion()
+        self._intervalo_posicion = Clock.schedule_interval(self._actualizar_posicion_seek, 0.5)
+
+    def _cancelar_intervalo_posicion(self):
+        if self._intervalo_posicion is not None:
+            self._intervalo_posicion.cancel()
+            self._intervalo_posicion = None
+
+    def _actualizar_posicion_seek(self, dt):
+        if self._reproductor is None or not self._duracion_actual_ms:
+            return
+        try:
+            posicion_ms = self._reproductor.getCurrentPosition()
+        except Exception:
+            traceback.print_exc()
+            return
+        fraccion = max(0.0, min(1.0, posicion_ms / self._duracion_actual_ms))
+        self.barra_seek.set_valor(fraccion * 100)
+        self.label_tiempo.text = (
+            f"{self._formatear_tiempo(posicion_ms)} / {self._formatear_tiempo(self._duracion_actual_ms)}"
+        )
+
+    def _buscar_posicion(self, fraccion):
+        """Callback de BarraSeek al tocarla: mueve la reproduccion a ese
+        punto del tema (funciona tanto sonando como en pausa)."""
+        if self._reproductor is None or not self._duracion_actual_ms:
+            return
+        try:
+            self._reproductor.seekTo(int(fraccion * self._duracion_actual_ms))
+        except Exception:
+            traceback.print_exc()
+
+    @staticmethod
+    def _formatear_tiempo(ms):
+        segundos_totales = max(0, int(ms / 1000))
+        minutos, segundos = divmod(segundos_totales, 60)
+        return f"{minutos}:{segundos:02d}"
 
     def _actualizar_estado_vacio(self):
         self.label_vacio.opacity = 0 if self.lista.children else 1
