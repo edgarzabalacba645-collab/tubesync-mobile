@@ -90,6 +90,7 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
 import yt_dlp
+from yt_dlp.utils import sanitize_filename
 
 # --- Paleta (tema oscuro, look de app moderna) ----------------------------
 COLOR_FONDO = (0.071, 0.071, 0.094, 1)        # casi negro
@@ -1427,7 +1428,7 @@ class TubeSyncMobileApp(App):
             try:
                 for intento in range(1, self._REINTENTOS_DESCARGA + 1):
                     try:
-                        link_descarga, caratula_forzada = self._resolver_link(link, fila)
+                        link_descarga, caratula_forzada, artista_spotify, titulo_spotify = self._resolver_link(link, fila)
                         fila.set_estado("PREPARANDO", COLOR_INFO)
                         opciones = self._opciones_descarga(fila)
                         with yt_dlp.YoutubeDL(opciones) as ydl:
@@ -1453,6 +1454,13 @@ class TubeSyncMobileApp(App):
                     # que busca la miniatura en disco por nombre sin saber
                     # ni importarle de donde salio.
                     self._forzar_caratula(archivo, caratula_forzada)
+
+                # Renombra a "Artista - Tema (Version)" (lo que pidio
+                # Edgar) ANTES de agregar metadatos/caratula -- ver
+                # docstring de _renombrar_a_nombre_descriptivo. Si no
+                # se pudo determinar un artista, devuelve "archivo"
+                # sin tocar (titulo original del video).
+                archivo = self._renombrar_a_nombre_descriptivo(archivo, info, artista_spotify, titulo_spotify)
 
                 try:
                     fila.set_estado("PROCESANDO", COLOR_INFO, detalle="agregando metadatos y caratula...")
@@ -1587,9 +1595,14 @@ class TubeSyncMobileApp(App):
         un link de YouTube pegado a mano. Si no es de Spotify, devuelve
         el link tal cual.
 
-        Devuelve (link_para_yt_dlp, url_caratula_o_None)."""
+        Devuelve (link_para_yt_dlp, url_caratula_o_None, artista_spotify_o_None,
+        titulo_spotify_o_None) -- los ultimos dos solo vienen completos
+        cuando "link" SI era de Spotify (para armar el nombre final del
+        archivo con el artista/titulo REALES de Spotify en vez de lo
+        que diga el titulo del video de YouTube que matcheo -- ver
+        _nombre_descriptivo)."""
         if not self._es_link_spotify(link):
-            return link, None
+            return link, None, None, None
 
         # Un link COPIADO DESDE LA APP de Spotify (el boton "Compartir
         # -> Copiar link", que es como Edgar comparte sus temas) no es
@@ -1642,7 +1655,7 @@ class TubeSyncMobileApp(App):
         consulta = f"{artista} - {titulo}"
         fila.set_estado("PREPARANDO", COLOR_INFO, detalle=f'Spotify -> buscando "{consulta}" en YouTube...')
         url_youtube = self._mejor_resultado_youtube(consulta, artista, titulo)
-        return url_youtube, caratula
+        return url_youtube, caratula, artista, titulo
 
     _CANTIDAD_RESULTADOS_BUSQUEDA = 5
 
@@ -1894,6 +1907,173 @@ class TubeSyncMobileApp(App):
                     pass
         with open(destino, "wb") as f:
             f.write(contenido)
+
+    _PATRON_PARENTESIS_FINAL = re.compile(r"\s*[\(\[]([^()\[\]]+)[\)\]]\s*$")
+
+    @classmethod
+    def _separar_titulo_version(cls, texto):
+        """Si "texto" termina con un parentesis o corchete -- "Tema
+        (Video Oficial)", "Tema [Lyric Video]", "Tema (Remix)" -- lo
+        separa en (titulo, version). Si no hay parentesis/corchete
+        final, devuelve (texto, None) sin tocar nada."""
+        texto = (texto or "").strip()
+        coincidencia = cls._PATRON_PARENTESIS_FINAL.search(texto)
+        if not coincidencia:
+            return texto, None
+        version = coincidencia.group(1).strip()
+        titulo = texto[: coincidencia.start()].strip()
+        return (titulo or texto), (version or None)
+
+    _PATRON_CANAL_TOPIC = re.compile(r"^(.+?)\s*-\s*topic$", re.IGNORECASE)
+    _PATRON_CANAL_VEVO = re.compile(r"^(.+?)vevo$", re.IGNORECASE)
+
+    @classmethod
+    def _artista_desde_canal(cls, canal):
+        """Un canal "Marcela Morelo - Topic" (el que genera YouTube
+        Music automaticamente para la discografia de un artista) o
+        "ArtistaVEVO" es, en la practica, el nombre del artista -- PERO
+        A PROPOSITO solo se usa el canal como artista cuando termina
+        en alguno de esos dos sufijos tecnicos, reconocibles con
+        certeza. El nombre de un canal CUALQUIERA (un canal de memes,
+        un vlog, un programa de TV) no es de forma confiable el
+        nombre de un "artista", y usarlo asi etiquetaria mal muchas
+        descargas que no son temas musicales -- asi que si el canal
+        no tiene ninguno de estos dos sufijos, se devuelve None (en
+        vez de arriesgar un nombre inventado) y el video se queda con
+        su titulo original, sin modificar."""
+        if not canal:
+            return None
+        canal = canal.strip()
+        coincidencia = cls._PATRON_CANAL_TOPIC.match(canal) or cls._PATRON_CANAL_VEVO.match(canal)
+        if not coincidencia:
+            return None
+        artista = coincidencia.group(1).strip()
+        return artista or None
+
+    @classmethod
+    def _nombre_descriptivo(cls, info, artista_spotify=None, titulo_spotify=None):
+        """Calcula (artista, titulo, version) para armar el nombre
+        final "Artista - Tema (Version)" que pidio Edgar, probando en
+        orden las fuentes mas confiables primero:
+
+        1. artista_spotify/titulo_spotify: cuando el link vino de
+           Spotify, _resolver_link ya consiguio ahi el artista/titulo
+           REALES del tema (no un texto que solo matcheo una
+           busqueda) -- maxima prioridad.
+        2. info["artist"]/info["artists"]: lo que yt-dlp llena cuando
+           el video de YouTube/YouTube Music esta reconocido como un
+           tema musical (via info["track"] para el titulo, que viene
+           SIN el artista adelante -- confirmado leyendo el codigo
+           fuente real del extractor de YouTube).
+        3. El nombre del canal (info["channel"]/info["uploader"]),
+           sacandole sufijos tipo "- Topic"/"VEVO" (_artista_desde_canal),
+           combinado con el titulo del video separado en
+           (titulo, version) por el ultimo parentesis/corchete
+           (_separar_titulo_version) -- el caso de un video de
+           YouTube comun, sin metadata musical estructurada.
+
+        Devuelve (None, None, None) si ningun camino dio un artista
+        -- quien llama debe entonces dejar el titulo original del
+        video tal cual, en vez de arriesgar un nombre peor."""
+        if artista_spotify and titulo_spotify:
+            titulo, version = cls._separar_titulo_version(titulo_spotify)
+            return artista_spotify.strip(), titulo, version
+
+        artista = info.get("artist") or info.get("artists")
+        if isinstance(artista, (list, tuple)):
+            artista = ", ".join(a for a in artista if a) or None
+        if isinstance(artista, str):
+            artista = artista.strip() or None
+
+        if artista:
+            titulo, version = cls._separar_titulo_version(info.get("track") or info.get("title"))
+            return artista, titulo, version
+
+        artista = cls._artista_desde_canal(info.get("channel") or info.get("uploader"))
+        if not artista:
+            return None, None, None
+
+        titulo, version = cls._separar_titulo_version(info.get("title"))
+        return artista, titulo, version
+
+    @staticmethod
+    def _armar_nombre_archivo(artista, titulo, version):
+        """"Artista - Tema" o, si se identifico una version (Remix,
+        Video Oficial, Live, etc.), "Artista - Tema (Version)"."""
+        nombre = f"{artista} - {titulo}"
+        if version:
+            nombre += f" ({version})"
+        return nombre
+
+    @staticmethod
+    def _destino_sin_colision(carpeta, nombre_base, extension):
+        """Si "nombre_base + extension" ya existe en "carpeta" (dos
+        descargas distintas que resultan en el mismo "Artista - Tema"),
+        le agrega " (2)", " (3)", etc. hasta encontrar un nombre libre
+        -- para no pisar un archivo que ya estaba en disco."""
+        candidato = os.path.join(carpeta, nombre_base + extension)
+        contador = 2
+        while os.path.isfile(candidato):
+            candidato = os.path.join(carpeta, f"{nombre_base} ({contador}){extension}")
+            contador += 1
+        return candidato
+
+    @classmethod
+    def _renombrar_a_nombre_descriptivo(cls, archivo, info, artista_spotify=None, titulo_spotify=None):
+        """Renombra el mp3 (y su miniatura/caratula -- yt-dlp siempre
+        la deja al lado, mismo nombre base, ver _incrustar_caratula)
+        al formato "Artista - Tema (Version)" que pidio Edgar, y de
+        paso ajusta info["artist"]/info["title"]/info["track"] para
+        que _agregar_metadatos_y_caratula (que lee esos mismos campos
+        -- ver FFmpegMetadataPP, confirmado leyendo su codigo fuente
+        real) escriba los tags ID3 acordes: el tag de artista con el
+        artista solo, el de titulo con "Tema (Version)" SIN el
+        artista adelante (asi se usan los tags ID3 de artista/titulo
+        -- no van juntos en el mismo campo).
+
+        Se llama DESPUES de _forzar_caratula (si vino de Spotify) y
+        ANTES de _agregar_metadatos_y_caratula, para que haya como
+        maximo una sola miniatura/caratula en disco con el nombre
+        base viejo al momento de renombrar.
+
+        Si no se pudo determinar un artista por ningun camino (ver
+        _nombre_descriptivo), no se toca nada -- se deja el archivo
+        con el titulo original del video, en vez de arriesgar un
+        nombre peor. Tampoco se toca nada si el rename en si falla
+        (permisos, disco, lo que sea): es a mejor esfuerzo, el audio
+        ya esta guardado y no vale la pena perderlo por esto.
+
+        Devuelve la ruta del mp3 (la nueva si se pudo renombrar, la
+        misma "archivo" si no)."""
+        artista, titulo, version = cls._nombre_descriptivo(info, artista_spotify, titulo_spotify)
+        if not artista or not titulo:
+            return archivo
+
+        info["artist"] = artista
+        info["title"] = f"{titulo} ({version})" if version else titulo
+        info["track"] = info["title"]
+
+        carpeta = os.path.dirname(archivo)
+        base_vieja = os.path.splitext(os.path.basename(archivo))[0]
+        nombre_base = sanitize_filename(cls._armar_nombre_archivo(artista, titulo, version), restricted=False)
+
+        destino_mp3 = cls._destino_sin_colision(carpeta, nombre_base, ".mp3")
+        try:
+            os.rename(archivo, destino_mp3)
+        except OSError:
+            traceback.print_exc()  # a mejor esfuerzo -- se sigue con el nombre original
+            return archivo
+
+        nombre_base_final = os.path.splitext(os.path.basename(destino_mp3))[0]
+        for extension in (".webp", ".jpg", ".jpeg", ".png"):
+            miniatura_vieja = os.path.join(carpeta, base_vieja + extension)
+            if os.path.isfile(miniatura_vieja):
+                try:
+                    os.rename(miniatura_vieja, os.path.join(carpeta, nombre_base_final + extension))
+                except OSError:
+                    traceback.print_exc()  # a mejor esfuerzo -- el mp3 ya quedo bien,
+                break                       # esto solo arriesga no encontrar la caratula
+        return destino_mp3
 
     def _opciones_descarga(self, fila):
         """Paso 1: solo descargar y convertir a mp3."""
